@@ -27,7 +27,7 @@ inline T& pow_byref(T& val, U p)
     val = T::csel(val, T::one(), p&1);
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
-    #pragma unroll
+    #pragma unroll 1
 #endif
     while (p >>= 1) {
         sqr.sqr();
