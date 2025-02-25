@@ -43,8 +43,13 @@ typedef size_t index_t;
 #define WINDOW_SIZE (1 << LG_WINDOW_SIZE)
 #define WINDOW_NUM ((MAX_LG_DOMAIN_SIZE + LG_WINDOW_SIZE - 1) / LG_WINDOW_SIZE)
 
+// Remove inline dynamic initialization for __constant__ arrays.
+// They must be initialized with compile-time constants.
+// The following are declared as extern here and defined (without an initializer)
+// in a corresponding .cu file.
 extern __device__ __constant__ fr_t forward_radix6_twiddles[32];
 extern __device__ __constant__ fr_t inverse_radix6_twiddles[32];
+
 
 #if !defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
 # if defined(FEATURE_BLS12_377)

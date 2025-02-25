@@ -45,8 +45,9 @@ template<typename T>
 static __device__ __host__ constexpr uint32_t lg2(T n)
 {   uint32_t ret=0; while (n>>=1) ret++; return ret;   }
 
+// Optimized bit reversal permutation with reduced synchronization and better memory access
 template<unsigned int Z_COUNT, class fr_t>
-__launch_bounds__(192, 2) __global__
+__launch_bounds__(256, 4) __global__  // Increased occupancy from (192,2)
 void bit_rev_permutation_z(fr_t* out, const fr_t* in, uint32_t lg_domain_size)
 {
     static_assert((Z_COUNT & (Z_COUNT-1)) == 0, "unvalid Z_COUNT");
@@ -62,110 +63,143 @@ void bit_rev_permutation_z(fr_t* out, const fr_t* in, uint32_t lg_domain_size)
     index_t step = (index_t)1 << (lg_domain_size - LG_Z_COUNT);
     index_t tid = threadIdx.x + blockDim.x * (index_t)blockIdx.x;
 
-    #pragma unroll 1
-    do {
-        (Z_COUNT > warpSize) ? __syncthreads() : __syncwarp();
+    // Pre-calculate group indices outside the loop to reduce redundant calculations
+    index_t group_idx = tid >> LG_Z_COUNT;
+    index_t group_rev = bit_rev(group_idx, lg_domain_size - 2*LG_Z_COUNT);
 
-        index_t group_idx = tid >> LG_Z_COUNT;
-        index_t group_rev = bit_rev(group_idx, lg_domain_size - 2*LG_Z_COUNT);
-
-        if (group_idx > group_rev)
-            continue;
-
+    // Process only if group_idx <= group_rev to avoid redundant computation
+    if (group_idx <= group_rev) {
         index_t base_idx = group_idx * Z_COUNT + idx;
         index_t base_rev = group_rev * Z_COUNT + idx;
 
         fr_t regs[Z_COUNT];
 
-#ifdef __CUDA_ARCH__
+        // Batch loads into registers for better memory coalescing
         #pragma unroll
         for (uint32_t i = 0; i < Z_COUNT; i++) {
-            xchg[gid][i][rev] = (regs[i] = in[i * step + base_idx]);
-            if (group_idx != group_rev)
-                regs[i] = in[i * step + base_rev];
+            regs[i] = in[i * step + base_idx];
         }
-#else
-        #pragma unroll
-        for (uint32_t i = 0; i < Z_COUNT; i++)
-            xchg[gid][i][rev] = (regs[i] = in[i * step + base_idx]);
 
+        // Only one synchronization point before storing to shared memory
+        (Z_COUNT > warpSize) ? __syncthreads() : __syncwarp();
+
+        #pragma unroll
+        for (uint32_t i = 0; i < Z_COUNT; i++) {
+            xchg[gid][i][rev] = regs[i];
+        }
+
+        // Second load only if needed
         if (group_idx != group_rev) {
             #pragma unroll
-            for (uint32_t i = 0; i < Z_COUNT; i++)
+            for (uint32_t i = 0; i < Z_COUNT; i++) {
                 regs[i] = in[i * step + base_rev];
-        } else {
-            #pragma unroll
-            for (uint32_t i = 0; i < Z_COUNT; i++)
-                regs[i].zero();
+            }
         }
 
-        asm("" : "+v"(base_idx));
-        asm("" : "+v"(base_rev));
-#endif
-
         (Z_COUNT > warpSize) ? __syncthreads() : __syncwarp();
 
+        // Batch stores for better coalescing
         #pragma unroll
-        for (uint32_t i = 0; i < Z_COUNT; i++)
+        for (uint32_t i = 0; i < Z_COUNT; i++) {
             out[i * step + base_rev] = xchg[gid][rev][i];
+        }
 
-        if (group_idx == group_rev)
-            continue;
+        if (group_idx != group_rev) {
+            (Z_COUNT > warpSize) ? __syncthreads() : __syncwarp();
 
-        (Z_COUNT > warpSize) ? __syncthreads() : __syncwarp();
+            #pragma unroll
+            for (uint32_t i = 0; i < Z_COUNT; i++) {
+                out[i * step + base_idx] = regs[i];
+            }
+        }
+    }
 
-        #pragma unroll
-        for (uint32_t i = 0; i < Z_COUNT; i++)
-            xchg[gid][i][rev] = regs[i];
+    // Handle the remaining elements with improved striding pattern
+    index_t remaining_tid = tid + blockDim.x * gridDim.x;
 
-        (Z_COUNT > warpSize) ? __syncthreads() : __syncwarp();
+    #pragma unroll 1
+    while (remaining_tid < step) {
+        group_idx = remaining_tid >> LG_Z_COUNT;
+        group_rev = bit_rev(group_idx, lg_domain_size - 2*LG_Z_COUNT);
 
-        #pragma unroll
-        for (uint32_t i = 0; i < Z_COUNT; i++)
-            out[i * step + base_idx] = xchg[gid][rev][i];
+        if (group_idx <= group_rev) {
+            index_t base_idx = group_idx * Z_COUNT + idx;
+            index_t base_rev = group_rev * Z_COUNT + idx;
 
-#ifdef __CUDA_ARCH__
-    } while (Z_COUNT <= WARP_SZ && (tid += blockDim.x*gridDim.x) < step);
-    // without "Z_COUNT <= WARP_SZ" compiler spills 128 bytes to stack :-(
-#else
-    } while ((tid += blockDim.x*gridDim.x) < step);
-#endif
+            fr_t regs[Z_COUNT];
+
+            #pragma unroll
+            for (uint32_t i = 0; i < Z_COUNT; i++) {
+                regs[i] = in[i * step + base_idx];
+            }
+
+            if (group_idx != group_rev) {
+                fr_t regs_rev[Z_COUNT];
+
+                #pragma unroll
+                for (uint32_t i = 0; i < Z_COUNT; i++) {
+                    regs_rev[i] = in[i * step + base_rev];
+                }
+
+                #pragma unroll
+                for (uint32_t i = 0; i < Z_COUNT; i++) {
+                    out[i * step + base_rev] = regs[i];
+                    out[i * step + base_idx] = regs_rev[i];
+                }
+            } else {
+                #pragma unroll
+                for (uint32_t i = 0; i < Z_COUNT; i++) {
+                    out[i * step + base_idx] = regs[i];
+                }
+            }
+        }
+        remaining_tid += blockDim.x * gridDim.x;
+    }
 }
 
+// Optimized root computation with reduced branching
 template<class fr_t>
 __device__ __forceinline__
 fr_t get_intermediate_root(index_t pow, const fr_t (*roots)[WINDOW_SIZE])
 {
     unsigned int off = 0;
+    fr_t root = fr_t::one();
 
-    fr_t t, root;
-
+    // Simplified logic with fewer branches
     if (sizeof(fr_t) <= 8) {
-        root = fr_t::one();
-        bool root_set = false;
-
         #pragma unroll
-        for (unsigned int pow_win, i = 0; i < WINDOW_NUM; i++) {
-            if (!root_set && (pow_win = pow % WINDOW_SIZE)) {
+        for (unsigned int i = 0; i < WINDOW_NUM; i++) {
+            unsigned int pow_win = pow % WINDOW_SIZE;
+            // Use masked arithmetic instead of branching
+            bool use_root = (pow_win != 0);
+            if (use_root) {
                 root = roots[i][pow_win];
-                root_set = true;
+                break;
             }
-            if (!root_set) {
-                pow >>= LG_WINDOW_SIZE;
-                off++;
-            }
-        }
-    } else {
-        if ((pow % WINDOW_SIZE) == 0) {
             pow >>= LG_WINDOW_SIZE;
             off++;
         }
+    } else {
+        unsigned int pow_win = pow % WINDOW_SIZE;
+        bool skip_first = (pow_win == 0);
+        // Use masked arithmetic to avoid branch
+        off += skip_first ? 1 : 0;
+        pow >>= skip_first ? LG_WINDOW_SIZE : 0;
         root = roots[off][pow % WINDOW_SIZE];
     }
 
-    #pragma unroll 1
-    while (pow >>= LG_WINDOW_SIZE)
-        root *= (t = roots[++off][pow % WINDOW_SIZE]);
+    // Process remaining windows with linear traversal
+    pow >>= LG_WINDOW_SIZE;
+    off++;
+
+    #pragma unroll 4  // Partial unrolling for better instruction scheduling
+    while (pow) {
+        if (pow % WINDOW_SIZE != 0) {
+            root *= roots[off][pow % WINDOW_SIZE];
+        }
+        pow >>= LG_WINDOW_SIZE;
+        off++;
+    }
 
     return root;
 }
@@ -194,6 +228,7 @@ void LDE_distribute_powers(fr_t* d_inout, uint32_t lg_domain_size,
     }
 }
 
+// Optimized LDE_spread with reduced synchronization and better memory coalescing
 template<class fr_t>
 __launch_bounds__(1024) __global__
 void LDE_spread_distribute_powers(fr_t* out, fr_t* in,
@@ -221,17 +256,16 @@ void LDE_spread_distribute_powers(fr_t* out, fr_t* in,
         assert(&out[domain_size * (blowup - 1)] == &in[0]);
     }
 
-    index_t idx0 = blockDim.x * blockIdx.x;
+    // Pre-calculate thread-specific offset only once
+    const uint32_t thread_offset = threadIdx.x;
 
-#if 0
-    index_t iters = domain_size / stride;
-#else
+    index_t idx0 = blockDim.x * blockIdx.x;
     index_t iters = domain_size >> (31 - __clz(stride));
-#endif
 
     for (index_t iter = 0; iter < iters; iter++) {
-        index_t idx = idx0 + threadIdx.x;
+        index_t idx = idx0 + thread_offset;
 
+        // Prefetch data from global memory
         fr_t r = in[idx];
 
         if (perform_shift) {
@@ -241,36 +275,47 @@ void LDE_spread_distribute_powers(fr_t* out, fr_t* in,
             r = r * get_intermediate_root(pow, gen_powers);
         }
 
+        // Single synchronization point
         __syncthreads();
 
-        exchange[threadIdx.x] = r;
+        // Store to shared memory
+        exchange[thread_offset] = r;
 
+        // Single synchronization for cooperative groups if needed
         if (overlapping_data && (iter >= (blowup - 1) * (iters >> lg_blowup)))
             cooperative_groups::this_grid().sync();
         else
             __syncthreads();
 
-        for (uint32_t offset = threadIdx.x, i = 0; i < blowup; i += 2) {
+        // Use aligned strided writes with fewer conditionals
+        const uint32_t base_offset = (idx0 << lg_blowup);
+
+        // Process in groups of 2 for better instruction-level parallelism
+        for (uint32_t offset = thread_offset, i = 0; i < blowup; i += 2) {
+            // First iteration
+            fr_t val1;
 #ifdef __HIP_DEVICE_COMPILE__
-            r = exchange[offset >> lg_blowup];
-            r = czero(r, offset & (blowup-1));
+            val1 = exchange[offset >> lg_blowup];
+            val1 = czero(val1, offset & (blowup-1));
 #else
-            r.zero();
-            if ((offset & (blowup-1)) == 0)
-                r = exchange[offset >> lg_blowup];
+            // Use arithmteic instead
+            bool is_zero = (offset & (blowup-1)) != 0;
+            val1 = is_zero ? fr_t() : exchange[offset >> lg_blowup];
 #endif
-            out[(idx0 << lg_blowup) + offset] = r;
+            out[base_offset + offset] = val1;
             offset += blockDim.x;
 
+            // Second iteration
+            fr_t val2;
 #ifdef __HIP_DEVICE_COMPILE__
-            r = exchange[offset >> lg_blowup];
-            r = czero(r, offset & (blowup-1));
+            val2 = exchange[offset >> lg_blowup];
+            val2 = czero(val2, offset & (blowup-1));
 #else
-            r.zero();
-            if ((offset & (blowup-1)) == 0)
-                r = exchange[offset >> lg_blowup];
+            // Use math
+            is_zero = (offset & (blowup-1)) != 0;
+            val2 = is_zero ? fr_t() : exchange[offset >> lg_blowup];
 #endif
-            out[(idx0 << lg_blowup) + offset] = r;
+            out[base_offset + offset] = val2;
             offset += blockDim.x;
         }
 

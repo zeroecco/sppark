@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 template <int intermediate_mul, class fr_t>
-__launch_bounds__(768, 1) __global__
+__launch_bounds__(768, 2) __global__
 void _CT_NTT(const unsigned int radix, const unsigned int lg_domain_size,
              const unsigned int stage, const unsigned int iterations,
              fr_t* d_inout, const fr_t (*d_partial_twiddles)[WINDOW_SIZE],
@@ -75,13 +75,14 @@ void _CT_NTT(const unsigned int radix, const unsigned int lg_domain_size,
         unsigned int rank = threadIdx.x & thrdMask;
         bool pos = rank < laneMask;
 
+        fr_t tw = d_radix6_twiddles[rank << (6 - (s + 1))];
+
         fr_t x = fr_t::csel(r1, r0, pos);
         x.shfl_bfly(laneMask);
         r0 = fr_t::csel(r0, x, pos);
         r1 = fr_t::csel(x, r1, pos);
 
-        fr_t t = d_radix6_twiddles[rank << (6 - (s + 1))];
-        t *= r1;
+        fr_t t = tw * r1;
 
         r1 = r0 - t;
         r0 = r0 + t;
@@ -93,9 +94,8 @@ void _CT_NTT(const unsigned int radix, const unsigned int lg_domain_size,
         unsigned int rank = threadIdx.x & thrdMask;
         bool pos = rank < laneMask;
 
-        fr_t t = d_radixX_twiddles[rank << (radix - (s + 1))];
+        fr_t tw = d_radixX_twiddles[rank << (radix - (s + 1))];
 
-        // shfl_bfly through the shared memory
         extern __shared__ fr_t shared_exchange[];
 
         fr_t x = fr_t::csel(r1, r0, pos);
@@ -106,7 +106,7 @@ void _CT_NTT(const unsigned int radix, const unsigned int lg_domain_size,
         r0 = fr_t::csel(r0, x, pos);
         r1 = fr_t::csel(x, r1, pos);
 
-        t *= r1;
+        fr_t t = tw * r1;
 
         r1 = r0 - t;
         r0 = r0 + t;
@@ -117,14 +117,15 @@ void _CT_NTT(const unsigned int radix, const unsigned int lg_domain_size,
         r1 *= d_domain_size_inverse;
     }
 
-    // rotate "iterations" bits in indices
     index_t mask = (index_t)((1 << iterations) - 1) << stage;
-    index_t rotw = idx0 & mask;
-    rotw = (rotw >> 1) | (rotw << (iterations - 1));
-    idx0 = (idx0 & ~mask) | (rotw & mask);
-    rotw = idx1 & mask;
-    rotw = (rotw >> 1) | (rotw << (iterations - 1));
-    idx1 = (idx1 & ~mask) | (rotw & mask);
+    index_t rotw0 = idx0 & mask;
+    index_t rotw1 = idx1 & mask;
+
+    rotw0 = (rotw0 >> 1) | (rotw0 << (iterations - 1));
+    rotw1 = (rotw1 >> 1) | (rotw1 << (iterations - 1));
+
+    idx0 = (idx0 & ~mask) | (rotw0 & mask);
+    idx1 = (idx1 & ~mask) | (rotw1 & mask);
 
     d_inout[idx0] = r0;
     d_inout[idx1] = r1;

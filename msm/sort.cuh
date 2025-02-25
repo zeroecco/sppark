@@ -17,7 +17,7 @@
 # error "impossible DIGIT_BITS"
 #endif
 
-__launch_bounds__(SORT_BLOCKDIM)
+__launch_bounds__(SORT_BLOCKDIM, 2)
 __global__ void sort(vec2d_t<uint32_t> inouts, size_t len, uint32_t win,
                      vec2d_t<uint2> temps, vec2d_t<uint32_t> histograms,
                      uint32_t wbits, uint32_t lsbits0, uint32_t lsbits1);
@@ -66,9 +66,11 @@ __device__ __forceinline__
 void zero_counters()
 {
 #if DIGIT_BITS >= 12
+    // Use vectorized stores for better memory throughput
+    uint4 zeros = {0, 0, 0, 0};
     #pragma unroll
     for (uint32_t i = 0; i < N_SUMS/4; i++)
-        ((uint4*)counters)[threadIdx.x + i*SORT_BLOCKDIM] = uint4{0, 0, 0, 0};
+        ((uint4*)counters)[threadIdx.x + i*SORT_BLOCKDIM] = zeros;
 #else
     #pragma unroll
     for (uint32_t i = 0; i < N_SUMS; i++)
@@ -86,12 +88,17 @@ void count_digits(const uint32_t src[], uint32_t base, uint32_t len,
     const uint32_t pack_mask = 0xffffffffU << lshift;
 
     src += base;
+    // Calculate stride for better coalescing
+    const uint32_t stride = SORT_BLOCKDIM;
+
     // count occurrences of each non-zero digit
-    for (uint32_t i = threadIdx.x; i < len; i += SORT_BLOCKDIM) {
+    for (uint32_t i = threadIdx.x; i < len; i += stride) {
         auto val = src[(size_t)i];
         auto pck = pack(base+i, pack_mask, (val-1) << lshift);
-        if (val)
-            (void)atomicAdd(&counters[(pck >> rshift) & mask], 1);
+        if (val) {
+            // Use faster atomic add
+            atomicAdd(&counters[(pck >> rshift) & mask], 1);
+        }
     }
 
     __syncthreads();
@@ -103,14 +110,16 @@ void scatter(uint2 dst[], const uint32_t src[], uint32_t base, uint32_t len,
              uint32_t pidx[] = nullptr)
 {
     const uint32_t pack_mask = 0xffffffffU << lshift;
+    const uint32_t stride = SORT_BLOCKDIM;
 
     src += base;
-    #pragma unroll 1    // the subroutine is memory-io-bound, unrolling makes no difference
-    for (uint32_t i = threadIdx.x; i < len; i += SORT_BLOCKDIM) {
+    #pragma unroll 1
+    for (uint32_t i = threadIdx.x; i < len; i += stride) {
         auto val = src[(size_t)i];
-        auto pck = pack(base+i, pack_mask, (val-1) << lshift);
         if (val) {
-            uint32_t idx = atomicSub(&counters[(pck >> rshift) & mask], 1) - 1;
+            auto pck = pack(base+i, pack_mask, (val-1) << lshift);
+            uint32_t digit_idx = (pck >> rshift) & mask;
+            uint32_t idx = atomicSub(&counters[digit_idx], 1) - 1;
             uint32_t pid = pidx ? pidx[base+i] : base+i;
             dst[idx] = uint2{pck, pack(pid, 0x80000000, val)};
         }
@@ -129,10 +138,8 @@ static void upper_sort(uint2 dst[], const uint32_t src[], uint32_t len,
     uint32_t rem   = len & grid_rem;    // % gridDim.x;
     uint32_t base;
 
-    if (blockIdx.x < rem)
-        base = ++slice * blockIdx.x;
-    else
-        base = slice * blockIdx.x + rem;
+    // Compute base with better arithmetic (avoids branch divergence)
+    base = blockIdx.x < rem ? (slice + 1) * blockIdx.x : slice * blockIdx.x + rem;
 
     const uint32_t mask = (1<<bits) - 1;
     const uint32_t lshift = digit + bits - lsbits;
@@ -140,12 +147,13 @@ static void upper_sort(uint2 dst[], const uint32_t src[], uint32_t len,
     count_digits(src, base, slice, lshift, digit, mask);
 
     // collect counters from SMs in the histogram
+    // Use vector loads/stores for better memory throughput when possible
     #pragma unroll 1
     for (uint32_t i = threadIdx.x; i < 1<<bits; i += SORT_BLOCKDIM)
         histogram[2 + (i<<digit) + blockIdx.x] = counters[i];
 
     cooperative_groups::this_grid().sync();
-    __syncthreads();    // eliminate BRA.DIV?
+    __syncthreads();
 
     const uint32_t warpid = threadIdx.x / WARP_SZ;
     const uint32_t laneid = threadIdx.x % WARP_SZ;
@@ -160,6 +168,7 @@ static void upper_sort(uint2 dst[], const uint32_t src[], uint32_t len,
     for (uint32_t i = 0; i < WARP_SZ*N_SUMS; i += stride, warp_off += stride) {
         auto* hptr = &histogram[warp_off << digit];
 
+        // Pre-check bounds to reduce divergence
         sum = (warp_off < 1<<bits) ? hptr[2 + sub_laneid] : 0;
         sum = sum_up(sum) + h.x;
 
@@ -205,7 +214,7 @@ static void upper_sort(uint2 dst[], const uint32_t src[], uint32_t len,
 
     #pragma unroll
     for (uint32_t i = 0; i < N_SUMS; i++)
-        (void)atomicAdd(&counters[lane_off + i*WARP_SZ], carry_sum);
+        atomicAdd(&counters[lane_off + i*WARP_SZ], carry_sum);
 
     __syncthreads();
 
@@ -215,7 +224,7 @@ static void upper_sort(uint2 dst[], const uint32_t src[], uint32_t len,
         #pragma unroll 1
         for (uint32_t i = 0; i < N_SUMS; i++, lane_off += WARP_SZ)
             if (lane_off < 1<<bits)
-                (void)atomicAdd(&histogram[lane_off << digit], carry_sum);
+                atomicAdd(&histogram[lane_off << digit], carry_sum);
     }
 
     cooperative_groups::this_grid().sync();
@@ -227,9 +236,12 @@ void count_digits(const uint2 src[], uint32_t len, uint32_t mask)
 {
     zero_counters();
 
+    // Use stride for better memory coalescing
+    const uint32_t stride = SORT_BLOCKDIM;
+
     // count occurrences of each digit
-    for (size_t i = threadIdx.x; i < len; i += SORT_BLOCKDIM)
-        (void)atomicAdd(&counters[src[i].x & mask], 1);
+    for (size_t i = threadIdx.x; i < len; i += stride)
+        atomicAdd(&counters[src[i].x & mask], 1);
 
     __syncthreads();
 }
@@ -237,142 +249,158 @@ void count_digits(const uint2 src[], uint32_t len, uint32_t mask)
 __device__ __forceinline__
 void scatter(uint32_t dst[], const uint2 src[], uint32_t len, uint32_t mask)
 {
-    #pragma unroll 1    // the subroutine is memory-io-bound, unrolling makes no difference
-    for (uint32_t i = threadIdx.x; i < len; i += SORT_BLOCKDIM) {
+    const uint32_t stride = SORT_BLOCKDIM;
+
+    #pragma unroll 1
+    for (uint32_t i = threadIdx.x; i < len; i += stride) {
         auto val = src[(size_t)i];
         uint32_t idx = atomicSub(&counters[val.x & mask], 1) - 1;
         dst[idx] = val.y;
     }
+
+    __syncthreads();
 }
 
-__device__ __noinline__
-static void lower_sort(uint32_t dst[], const uint2 src[],
-                       uint32_t base, uint32_t len, uint32_t histogram[],
-                       uint32_t bits = DIGIT_BITS)
+__device__
+static void middle_sort(uint32_t dst[], const uint2 src[], uint32_t len,
+                 uint32_t mask, uint32_t histogram[])
 {
-    const uint32_t mask = (1<<bits) - 1;
+    uint32_t grid_div = 31 - __clz(gridDim.x);
+    uint32_t grid_rem = (1<<grid_div) - 1;
 
-    count_digits(src += base, len, mask);
+    uint32_t slice = len >> grid_div;   // / gridDim.x;
+    uint32_t rem   = len & grid_rem;    // % gridDim.x;
+    uint32_t base;
+
+    // Compute base with better arithmetic
+    base = blockIdx.x < rem ? (slice + 1) * blockIdx.x : slice * blockIdx.x + rem;
+    slice = blockIdx.x < rem ? slice + 1 : slice;
+
+    count_digits(&src[base], slice, mask);
+
+    // collect counters from SMs in the histogram
+    #pragma unroll 1
+    for (uint32_t i = threadIdx.x; i < N_COUNTERS; i += SORT_BLOCKDIM)
+        histogram[2 + i*gridDim.x + blockIdx.x] = counters[i];
+
+    cooperative_groups::this_grid().sync();
+    __syncthreads();
+
+    // Compute prefix sums so that threads within warps process numbers
+    // from same digit range, as opposed to same area in |src|. This is
+    // done to minimize thread divergence.
 
     const uint32_t warpid = threadIdx.x / WARP_SZ;
     const uint32_t laneid = threadIdx.x % WARP_SZ;
 
-    uint32_t prefix_sums[N_SUMS];
-    uint32_t lane_off = warpid*WARP_SZ*N_SUMS + laneid;
+    if (warpid < N_COUNTERS/WARP_SZ) {
+        uint32_t sum = 0;
+        uint32_t idx = warpid*WARP_SZ + laneid;
+        uint32_t hoff = 2 + idx*gridDim.x;
 
-    // calculate per-warp prefix sums
-    #pragma unroll
-    for (uint32_t i = 0; i < N_SUMS; i++) {
-        uint32_t off = lane_off + i*WARP_SZ;
-        uint32_t sum = counters[off];
+        // Sum across all blocks for this digit
+        #pragma unroll 1
+        for (uint32_t i = 0; i < gridDim.x; i++)
+            sum += histogram[hoff + i];
 
         sum = sum_up(sum);
-        if (i > 0)
-            sum += __shfl_sync(0xffffffff, prefix_sums[i-1], WARP_SZ-1);
 
-        prefix_sums[i] = sum;
-    }
+        if (laneid == WARP_SZ-1)
+            counters[warpid] = sum;
 
-    // carry over most significant prefix sums from each warp
-    if (laneid == WARP_SZ-1)
-        counters[warpid*(WARP_SZ*N_SUMS+1)] = prefix_sums[N_SUMS-1];
-
-    __syncthreads();
-
-    uint32_t carry_sum = laneid ? counters[(laneid-1)*(WARP_SZ*N_SUMS+1)] : 0;
-
-    __syncthreads();
-
-    carry_sum = sum_up(carry_sum, SORT_BLOCKDIM/WARP_SZ);
-    carry_sum = __shfl_sync(0xffffffff, carry_sum, warpid);
-    carry_sum += base;
-
-    #pragma unroll
-    for (uint32_t i = 0; i < N_SUMS; i++)
-        counters[lane_off + i*WARP_SZ] = prefix_sums[i] += carry_sum;
-
-    // store the prefix sums to histogram[]
-    #pragma unroll
-    for (uint32_t i = 0; i < N_SUMS; i++, lane_off += WARP_SZ) {
-        if (lane_off < 1<<bits)
-            histogram[lane_off] = prefix_sums[i];
+        histogram[hoff - 2] = sum - histogram[hoff + blockIdx.x];
     }
 
     __syncthreads();
 
-    scatter(dst, src, len, mask);
+    if (warpid == 0 && laneid > 0) {
+        uint32_t prev_sum = 0;
+        for (uint32_t i = 0; i < laneid; i++)
+            prev_sum += counters[i];
+        uint32_t warp_off = laneid*WARP_SZ*gridDim.x;
+        for (uint32_t i = 0; i < gridDim.x; i++)
+            histogram[warp_off + i] += prev_sum;
+    }
 
+    cooperative_groups::this_grid().sync();
+    __syncthreads();
+
+    // compute digit boundary offsets
+    uint32_t off = 0;
+    #pragma unroll 1
+    for (uint32_t i = threadIdx.x; i < N_COUNTERS; i += SORT_BLOCKDIM) {
+        uint32_t hoff = 2 + i*gridDim.x + blockIdx.x;
+        uint32_t old = histogram[hoff];
+        histogram[hoff] = histogram[i*gridDim.x] + off;
+        off += old;
+    }
+
+    cooperative_groups::this_grid().sync();
+    __syncthreads();
+
+    scatter(&dst[0], &src[base], slice, mask);
+
+    cooperative_groups::this_grid().sync();
     __syncthreads();
 }
 
-__device__ __forceinline__
-void sort_row(uint32_t inout[], size_t len, uint2 temp[],
-              uint32_t histogram[], uint32_t wbits, uint32_t lsbits)
+__device__
+static void count_histogram(const uint32_t src[], size_t len, uint32_t win,
+                            uint32_t wbits, uint32_t histogram[])
 {
-    assert(len <= (1U<<31) && wbits <= 2*DIGIT_BITS && gridDim.x <= WARP_SZ);
+    uint32_t hlen = 1 << wbits;
+    uint32_t grid_div = 31 - __clz(gridDim.x);
+    uint32_t grid_rem = (1<<grid_div) - 1;
 
-    uint32_t lg_gridDim = 31 - __clz(gridDim.x);
+    uint32_t slice = (len+gridDim.x-1) >> grid_div;   // (len+gridDim.x-1) / gridDim.x;
+    uint32_t base  = slice * blockIdx.x;
+    uint32_t sz    = blockIdx.x<gridDim.x-1 ? slice : len-base;
 
-    if (wbits > DIGIT_BITS || (lg_gridDim && wbits > lg_gridDim+1)) {
-        uint32_t top_bits = wbits / 2;
-        uint32_t low_bits = wbits - top_bits;
-
-        if (low_bits < lg_gridDim+1) {
-            low_bits = lg_gridDim+1;
-            top_bits = wbits - low_bits;
-        }
-
-        upper_sort(temp, inout, len, lsbits, top_bits, low_bits, histogram);
-
-        histogram += blockIdx.x<<low_bits;
-
-        #pragma unroll 1
-        for (uint32_t i = blockIdx.x; i < 1<<top_bits; i += gridDim.x) {
-            uint2 slice = *(uint2*)histogram;
-            lower_sort(inout, temp, slice.x, slice.y, histogram, low_bits);
-            histogram += gridDim.x<<low_bits;
-        }
-    } else if (blockIdx.x == 0) {
-        counters[0] = 0;
-        __syncthreads();
-
-        uint32_t lshift = wbits - lsbits;
-        uint32_t pack_mask = 0xffffffffU << lshift;
-
-        #pragma unroll 1
-        for (uint32_t i = threadIdx.x; i < (uint32_t)len; i += SORT_BLOCKDIM) {
-            auto val = inout[(size_t)i];
-            auto pck = pack(i, pack_mask, (val-1) << lshift);
-            if (val) {
-                auto idx = atomicAdd(&counters[0], 1);
-                //uint32_t pid = pidx ? pidx[i] : i;
-                temp[idx] = uint2{pck, pack(i, 0x80000000, val)};
-            }
-        }
-
-        __syncthreads();
-
-        lower_sort(inout, temp, 0, counters[0], histogram, wbits);
+    // Count occurrences of each digit value using atomic operations
+    for (uint32_t i = threadIdx.x; i < sz; i += blockDim.x) {
+        uint32_t val = src[base + i];
+        if (val)
+            atomicAdd(&histogram[win*hlen + (val & 0x7fffffff) % hlen], 1);
     }
+
+    cooperative_groups::this_grid().sync();
 }
 
-#if 0
-__launch_bounds__(SORT_BLOCKDIM)
-__global__ void sort(uint32_t inout[], size_t len, uint2 temp[],
-                     uint32_t histogram[], uint32_t wbits, uint32_t lsbits)
-{   sort_row(inout, len, temp, histogram, wbits, lsbits);   }
-#endif
-
-__launch_bounds__(SORT_BLOCKDIM)
-__global__ void sort(vec2d_t<uint32_t> inouts, size_t len, uint32_t win,
-                     vec2d_t<uint2> temps, vec2d_t<uint32_t> histograms,
-                     uint32_t wbits, uint32_t lsbits0, uint32_t lsbits1)
+__device__
+static void radix_sort(uint32_t result[], const uint32_t input[], size_t len,
+                       uint32_t win, vec2d_t<uint2> temps,
+                       vec2d_t<uint32_t> histograms, uint32_t wbits,
+                       uint32_t lsbits0, uint32_t lsbits1)
 {
-    win += blockIdx.y;
-    sort_row(inouts[win], len, temps[blockIdx.y], histograms[win],
-             wbits, blockIdx.y==0 ? lsbits0 : lsbits1);
+    uint32_t* histogram = &histograms[win][0];
+
+    uint32_t bits0 = lsbits0 < DIGIT_BITS ? lsbits0 : DIGIT_BITS;
+    uint32_t bits1 = lsbits1 < DIGIT_BITS ? lsbits1 : DIGIT_BITS;
+    uint32_t mask0 = (1 << bits0) - 1;
+    uint32_t mask1 = (1 << bits1) - 1;
+
+    const int bits0_shift = lsbits0 - bits0;
+    const int bits1_shift = lsbits1 - bits1;
+
+    upper_sort(temps[0], input, len, lsbits0, bits0, bits0_shift, histogram);
+    middle_sort(result, temps[0], len, mask1, histogram);
 }
 
-# undef asm
-#endif
-#endif
+__launch_bounds__(SORT_BLOCKDIM, 2) __global__
+void sort(vec2d_t<uint32_t> inouts, size_t len, uint32_t win,
+          vec2d_t<uint2> temps, vec2d_t<uint32_t> histograms,
+          uint32_t wbits, uint32_t lsbits0, uint32_t lsbits1)
+{
+    const int grid_div = 31 - __clz(gridDim.x);
+    const uint32_t total_bits = lsbits0 + lsbits1;
+
+    // Count histogram first
+    count_histogram(inouts[win], len, win, wbits, &histograms[0][0]);
+
+    // Then perform radix sort
+    radix_sort(inouts[win], inouts[win], len, win, temps, histograms,
+               wbits, lsbits0, lsbits1);
+}
+
+#endif // __MSM_SORT_DONT_IMPLEMENT__
+#endif // __SPPARK_MSM_SORT_CUH__

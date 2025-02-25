@@ -35,10 +35,10 @@ class scalar_T {
     uint32_t val[sizeof(scalar_t)/sizeof(uint32_t)][WARP_SZ];
 
 public:
-    __device__ const uint32_t& operator[](size_t i) const  { return val[i][0]; }
-    __device__ scalar_T& operator()(uint32_t laneid)
+    __device__ __forceinline__ const uint32_t& operator[](size_t i) const  { return val[i][0]; }
+    __device__ __forceinline__ scalar_T& operator()(uint32_t laneid)
     {   return *reinterpret_cast<scalar_T*>(&val[0][laneid]);   }
-    __device__ scalar_T& operator=(const scalar_t& rhs)
+    __device__ __forceinline__ scalar_T& operator=(const scalar_t& rhs)
     {
         for (size_t i = 0; i < sizeof(scalar_t)/sizeof(uint32_t); i++)
             val[i][0] = rhs[i];
@@ -70,7 +70,7 @@ static uint32_t booth_encode(uint32_t wval, uint32_t wmask, uint32_t wbits)
 #endif
 
 template<class scalar_t>
-__launch_bounds__(1024) __global__
+__launch_bounds__(1024, 2) __global__
 void breakdown(vec2d_t<uint32_t> digits, const scalar_t scalars[], size_t len,
                uint32_t nwins, uint32_t wbits, bool mont = true)
 {
@@ -146,7 +146,7 @@ template<class bucket_t,
          class affine_h,
          class bucket_h = class bucket_t::mem_t,
          class affine_t = class bucket_t::affine_t>
-__launch_bounds__(ACCUMULATE_NTHREADS) __global__
+__launch_bounds__(ACCUMULATE_NTHREADS, 2) __global__
 void accumulate(bucket_h buckets_[], uint32_t nwins, uint32_t wbits,
                 /*const*/ affine_h points_[], const vec2d_t<uint32_t> digits,
                 const vec2d_t<uint32_t> histogram, uint32_t sid = 0)
@@ -223,7 +223,7 @@ void accumulate(bucket_h buckets_[], uint32_t nwins, uint32_t wbits,
 }
 
 template<class bucket_t, class bucket_h = class bucket_t::mem_t>
-__launch_bounds__(256) __global__
+__launch_bounds__(256, 2) __global__
 void integrate(bucket_h buckets_[], uint32_t nwins, uint32_t wbits, uint32_t nbits)
 {
     const uint32_t degree = bucket_t::degree;

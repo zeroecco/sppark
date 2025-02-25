@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 template <int intermediate_mul, class fr_t>
-__launch_bounds__(768, 1) __global__
+__launch_bounds__(768, 2) __global__
 void _GS_NTT(const unsigned int radix, const unsigned int lg_domain_size,
              const unsigned int stage, const unsigned int iterations,
              fr_t* d_inout, const fr_t (*d_partial_twiddles)[WINDOW_SIZE],

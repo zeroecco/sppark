@@ -48,7 +48,7 @@ public:
 
 template <typename Operation, int CHUNK, typename fr_t = typename Operation::T,
           class OutPtr = fr_t*, class InPtr = const fr_t*>
-__global__ __launch_bounds__(sizeof(fr_t)<=16 ? 1024 : 512)
+__global__ __launch_bounds__(sizeof(fr_t)<=16 ? 1024 : 512, 2)
 void d_prefix_op(OutPtr out, InPtr inp, size_t len)
 {
     struct warp {
@@ -202,196 +202,141 @@ void d_prefix_op(OutPtr out, InPtr inp, size_t len)
         __syncthreads();
 
         fr_t warp_carry = identity;
+        if (warpid == 0) {
+            fr_t carry = identity;
+            if (laneid < nwarps-1)
+                carry = xchg[laneid];
 
-        if (laneid < nwarps && laneid > 0)
-            warp_carry = xchg[laneid - 1];
+            warp_carry = warp::prefix_op(carry);
 
-        warp_carry = warp::prefix_op(warp_carry, nwarps);
-        warp_carry = shfl_idx(warp_carry, warpid);
-
-        if (coalesce) {
-            chunk[CHUNK - 1] = op(chunk[CHUNK - 1], warp_carry);
-        } else {
-            fr_t lane_carry = shfl_up(chunk[CHUNK-1], 1);
-            lane_carry = fr_t::csel(identity, lane_carry, laneid == 0);
-
-            chunk[CHUNK - 1] = op(chunk[CHUNK - 1], warp_carry);
-
-            warp_carry = op(warp_carry, lane_carry);
+            if (laneid < nwarps-1)
+                xchg[laneid] = carry;
         }
 
-        fr_t grid_carry_in = grid_carry;
+        __syncthreads();
 
-        if (gridDim.x == 1) {
-            if (threadIdx.x == blockDim.x-1)
-                xchg[1024/WARP_SZ - 1] = chunk[CHUNK - 1];
-
-            __syncthreads();
-
-            grid_carry = xchg[1024/WARP_SZ - 1];
-            grid_carry = op(grid_carry, grid_carry_in);
-        } else {
-            bool tail_sync = !do_prefetch ||
-                             (len - blob) <= (2*blob_size - chunk_size);
-            uint32_t bias = tail_sync ? 0 : blob_size;
-
-            size_t grid_xchg = blob + (blockIdx.x*chunk_size + bias);
-            if (threadIdx.x == blockDim.x-1 && grid_xchg < len)
-                out[grid_xchg] = chunk[CHUNK - 1];
-
-            cooperative_groups::this_grid().sync();
-            __syncthreads();
-
-            uint32_t rank = gridDim.x <= WARP_SZ ? laneid : threadIdx.x;
-
-            fr_t block_carry = identity;
-
-            grid_xchg = blob + (rank*chunk_size + bias);
-            if (rank < gridDim.x && grid_xchg < len)
-                block_carry = out[grid_xchg];
-
-            block_carry = warp::prefix_op(block_carry, min(WARP_SZ, gridDim.x));
-
-            if (gridDim.x <= WARP_SZ) {
-                grid_carry = op(grid_carry, shfl_idx(block_carry, gridDim.x-1));
-
-                if (blockIdx.x > 0)
-                    block_carry = shfl_idx(block_carry, blockIdx.x - 1);
-                else
-                    block_carry = identity;
+        if (warpid != 0) {
+            if (coalesce) {
+                fr_t carry = xchg[warpid-1];
+                #pragma unroll
+                for (int i = 0; i < CHUNK; i++)
+                    chunk[i] = op(chunk[i], carry);
             } else {
-                const uint32_t nwarps = (gridDim.x + WARP_SZ - 1) / WARP_SZ;
+                auto carry = coalesce ? xchg[warpid-1]
+                                      : chunk[CHUNK-1] = op(chunk[CHUNK-1],
+                                                            xchg[warpid-1]);
+                #pragma unroll
+                for (int i = 0; i < CHUNK-1; i++)
+                    chunk[i] = op(chunk[i], carry);
+            }
+        }
 
-                // The last warp saves a value only when gridDim.x is
-                // divisible by WARP_SZ. However, note that this value is
-                // later disregarded, hence there is no need to handle all
-                // divisibility cases, comparison to gridDim.x suffices.
-                if (laneid == WARP_SZ - 1 && threadIdx.x < gridDim.x)
-                    xchg[warpid] = block_carry;
+        fr_t (&block_carry) = xchg[nwarps - 1];
 
-                __syncthreads();
+        /* We are running cooperatively, which effectively means
+         * gridDim.x <= #SMs, which is few dozens of blocks.
+         */
+        if (gridDim.x > 1) {
+            cooperative_groups::this_grid().sync();
 
-                fr_t inner_carry = identity;
-
-                if (laneid < nwarps && laneid > 0)
-                    inner_carry = xchg[laneid - 1];
-
-                inner_carry = warp::prefix_op(inner_carry, nwarps);
-                inner_carry = shfl_idx(inner_carry, warpid);
-
-                __syncthreads();
-
-                if (threadIdx.x == blockIdx.x-1 || threadIdx.x == gridDim.x-1) {
-                    block_carry = op(block_carry, inner_carry);
-                    xchg[threadIdx.x == gridDim.x-1] = block_carry;
+            if (blockIdx.x == 0) {
+                fr_t carry = identity;
+                /* This code path is executed by just a few dozen threads,
+                 * so there is no need to make laneid==0 prefetch the carry.
+                 */
+                if (tid < gridDim.x-1) {
+                    size_t blocks_chunk = blob / chunk_size;
+                    size_t block_id = blocks_chunk * gridDim.x + tid + 1;
+                    if (block_id < gridDim.x)
+                        carry = out[block_id * chunk_size - 1];
                 }
 
-                __syncthreads();
+                const uint32_t limit = (gridDim.x + WARP_SZ - 1) / WARP_SZ;
+                carry = warp::prefix_op(carry, limit * WARP_SZ);
 
-                if (blockIdx.x > 0)
-                    block_carry = xchg[0];
-                else
-                    block_carry = identity;
-
-                grid_carry = xchg[1];
-                grid_carry = op(grid_carry, grid_carry_in);
+                if (tid < gridDim.x-1) {
+                    size_t blocks_chunk = blob / chunk_size;
+                    size_t block_id = blocks_chunk * gridDim.x + tid + 1;
+                    if (block_id < gridDim.x)
+                        out[block_id * chunk_size - 1] = carry;
+                }
             }
 
-            if (tail_sync) {
-                cooperative_groups::this_grid().sync();
-                __syncthreads();
+            cooperative_groups::this_grid().sync();
+
+            if (blockIdx.x != 0) {
+                size_t idx = blockIdx.x * chunk_size - 1;
+                if (idx < len && blob == 0) {
+                    if (threadIdx.x == 0)
+                        grid_carry = out[idx];
+                } else {
+                    size_t blocks_chunk = blob / chunk_size;
+                    size_t block_id = blocks_chunk * gridDim.x + blockIdx.x;
+                    if (block_id > 0 && block_id < gridDim.x) {
+                        if (threadIdx.x == 0)
+                            grid_carry = out[block_id * chunk_size - 1];
+                    }
+                }
             }
 
-            grid_carry_in = op(grid_carry_in, block_carry);
+            __syncthreads();
         }
 
-        warp_carry = op(warp_carry, grid_carry_in);
-
         #pragma unroll
-        for (int i = 0; i < CHUNK-1; i++)
-            chunk[i] = op(chunk[i], warp_carry);
-
-        chunk[CHUNK - 1] = op(chunk[CHUNK - 1], grid_carry_in);
-
-        #pragma unroll
-        for(int i = 0; i < CHUNK; i++) {
-            if (i < top)
-                out[lane_idx + (coalesce ? WARP_SZ*i : i)] = chunk[i];
+        for (int i = 0; i < CHUNK; i++) {
+            size_t idx = lane_idx + (coalesce ? WARP_SZ*i : i);
+            if (idx < len)
+                out[idx] = op(chunk[i], grid_carry);
         }
+
+        if (blob + chunk_size < len && threadIdx.x == 0 && blockIdx.x == gridDim.x-1) {
+            out[blob + chunk_size - 1] = op(block_carry, grid_carry);
+        }
+
+        cooperative_groups::this_grid().sync();
+
+        if (blockIdx.x == gridDim.x-1 && warpid == nwarps-1 &&
+            laneid == WARP_SZ-1 && blob + blob_size < len)
+            grid_carry = op(block_carry, grid_carry);
     }
 }
 
 template <typename Operation, typename fr_t = typename Operation::T,
-          class OutPtr = fr_t*, class InPtr = const fr_t*,
-          class stream_t>
-void prefix_op(OutPtr d_out, InPtr d_inp, size_t len, const stream_t& s,
-               int gridDim = 0)
+          class OutPtr = fr_t*, class InPtr = const fr_t*>
+void prefix_op(OutPtr out, InPtr inp, size_t len, cudaStream_t stream = 0)
 {
-    if (gridDim <= 0)
-        gridDim = s.sm_count();
+    const int CHUNK = Operation::CHUNK;
+    const float bytes_per_ms = 25000;  /* observed bandwidth */
+    const float performance = bytes_per_ms*1e-6 / sizeof(fr_t);
+    const float time = len / (256 * performance);
+    int gridDim;
+    if (time < 1.0)
+        gridDim = 1;
+    else if (time < 2.5)
+        gridDim = 2;
+    else if (time < 5.0)
+        gridDim = 4;
+    else if (time < 10.0)
+        gridDim = 8;
+    else if (time < 20.0)
+        gridDim = 16;
+    else
+        gridDim = 32;
 
-    int blockDim = sizeof(fr_t)<=16 ? 1024 : 512;
-    int chunkSize = blockDim * Operation::CHUNK;
+    int tpb = sizeof(fr_t) <= 16 ? 1024 : 512;
+    if (tpb > len)
+        tpb = (len + 31) / 32 * 32;
+    else if (tpb*CHUNK > len)
+        tpb /= 2;
 
-    size_t blocks = (len + chunkSize - 1)/chunkSize;
+    size_t smem = 0;
 
-# define __PREFIX_OP__(N) d_prefix_op<Operation, N, fr_t, OutPtr, InPtr>
+    dim3 block(tpb);
+    dim3 grid(gridDim);
 
-    if (blocks <= (unsigned)gridDim) {
-        if ((Operation::CHUNK/4)*4 == Operation::CHUNK &&
-            blocks*4 <= (unsigned)gridDim) {
-            // +70-90% improvement depending on field and GPU
-            chunkSize = blockDim * Operation::CHUNK/4;
-            gridDim = (int)((len + chunkSize - 1)/chunkSize);
-            s.launch_coop(__PREFIX_OP__(Operation::CHUNK/4),
-                          {gridDim, blockDim},
-                          d_out, d_inp, len);
-            return;
-        } else if ((Operation::CHUNK/2)*2 == Operation::CHUNK &&
-                   blocks*2 <= (unsigned)gridDim) {
-            // +20-40% improvement depending on field and GPU
-            chunkSize = blockDim * Operation::CHUNK/2;
-            gridDim = (int)((len + chunkSize - 1)/chunkSize);
-            s.launch_coop(__PREFIX_OP__(Operation::CHUNK/2),
-                          {gridDim, blockDim},
-                          d_out, d_inp, len);
-            return;
-        } else if ((Operation::CHUNK*3/4)*4 == Operation::CHUNK*3 &&
-                   blocks*4 <= (unsigned)gridDim*3) {
-            // +10-20% improvement depending on field and GPU
-            chunkSize = blockDim * Operation::CHUNK*3/4;
-            gridDim = (int)((len + chunkSize - 1)/chunkSize);
-            s.launch_coop(__PREFIX_OP__(Operation::CHUNK*3/4),
-                          {gridDim, blockDim},
-                          d_out, d_inp, len);
-            return;
-        }
+    void* kernel = (void*)d_prefix_op<Operation, CHUNK, fr_t, OutPtr, InPtr>;
+    void* args[] = {&out, &inp, &len};
 
-        gridDim = (int)blocks;
-    } else if ((Operation::CHUNK*3/4)*4 == Operation::CHUNK*3) {
-        chunkSize = blockDim * (Operation::CHUNK*3/4);
-        blocks = (len + chunkSize - 1)/chunkSize;
-
-        if (blocks <= (unsigned)gridDim*2) {
-            // +10-20% improvement depending on field and GPU
-            s.launch_coop(__PREFIX_OP__(Operation::CHUNK*3/4),
-                          {gridDim, blockDim},
-                          d_out, d_inp, len);
-            return;
-        }
-    }
-
-    s.launch_coop(__PREFIX_OP__(Operation::CHUNK),
-                  {gridDim, blockDim},
-                  d_out, d_inp, len);
-
-# undef __PREFIX_OP__
-}
-
-template <typename Operation, typename fr_t = typename Operation::T, class stream_t>
-void prefix_op(fr_t* d_inout, size_t len, const stream_t& s, int gridDim = 0)
-{
-    prefix_op<Operation>(d_inout, reinterpret_cast<const fr_t*>(d_inout), len,
-                         s, gridDim);
+    cudaLaunchCooperativeKernel(kernel, grid, block, args, smem, stream);
 }
 #endif

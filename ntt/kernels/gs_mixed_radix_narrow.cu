@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 template<int z_count, bool coalesced = false, class fr_t>
-__launch_bounds__(768, 1) __global__
+__launch_bounds__(768, 2) __global__
 void _GS_NTT(const unsigned int radix, const unsigned int lg_domain_size,
              const unsigned int stage, const unsigned int iterations,
              fr_t* d_inout, const fr_t (*d_partial_twiddles)[WINDOW_SIZE],
@@ -83,7 +83,7 @@ void _GS_NTT(const unsigned int radix, const unsigned int lg_domain_size,
             r[0][z] = fr_t::csel(r[0][z], t, pos);
             r[1][z] = fr_t::csel(t, r[1][z], pos);
         }
-        noop();
+        asm volatile("" ::: "memory");
     }
 
     #pragma unroll 1
@@ -108,7 +108,7 @@ void _GS_NTT(const unsigned int radix, const unsigned int lg_domain_size,
             r[0][z] = fr_t::csel(r[0][z], t, pos);
             r[1][z] = fr_t::csel(t, r[1][z], pos);
         }
-        noop();
+        asm volatile("" ::: "memory");
     }
 
     #pragma unroll
@@ -117,7 +117,7 @@ void _GS_NTT(const unsigned int radix, const unsigned int lg_domain_size,
         r[0][z] = r[0][z] + r[1][z];
         r[1][z] = t;
     }
-    noop();
+    asm volatile("" ::: "memory");
 
     if (stage - iterations != 0) {
         index_t thread_ntt_pos = (tiz & inp_mask) >> (iterations - 1);
@@ -160,12 +160,12 @@ void _GS_NTT(const unsigned int radix, const unsigned int lg_domain_size,
 
     // rotate "iterations" bits in indices
     index_t mask = (index_t)((1 << iterations) - 1) << (stage - iterations);
-    index_t rotw = idx0 & mask;
-    rotw = (rotw << 1) | (rotw >> (iterations - 1));
-    idx0 = (idx0 & ~mask) | (rotw & mask);
-    rotw = idx1 & mask;
-    rotw = (rotw << 1) | (rotw >> (iterations - 1));
-    idx1 = (idx1 & ~mask) | (rotw & mask);
+    index_t rotw0 = idx0 & mask;
+    index_t rotw1 = idx1 & mask;
+    rotw0 = (rotw0 << 1) | (rotw0 >> (iterations - 1));
+    rotw1 = (rotw1 << 1) | (rotw1 >> (iterations - 1));
+    idx0 = (idx0 & ~mask) | (rotw0 & mask);
+    idx1 = (idx1 & ~mask) | (rotw1 & mask);
 
     if (coalesced) {
         transpose<z_count>(r[0]);
