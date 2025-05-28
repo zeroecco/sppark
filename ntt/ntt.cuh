@@ -87,10 +87,14 @@ private:
         if (domain_size < warpSize)
             LDE_distribute_powers<<<1, domain_size, 0, stream>>>
                                  (inout, lg_dsz, lg_blowup, bitrev, gen_powers);
-        else if (lg_dsz < 32)
-            LDE_distribute_powers<<<domain_size / warpSize, warpSize, 0, stream>>>
+        else if (lg_dsz < 32) {
+            // Cap the number of blocks to prevent exceeding CUDA limits
+            uint32_t desired_blocks = (uint32_t)(domain_size / warpSize);
+            uint32_t max_blocks = stream.sm_count() * 2;
+            uint32_t num_blocks = (desired_blocks < max_blocks) ? desired_blocks : max_blocks;
+            LDE_distribute_powers<<<num_blocks, warpSize, 0, stream>>>
                                  (inout, lg_dsz, lg_blowup, bitrev, gen_powers);
-        else
+        } else
             LDE_distribute_powers<<<stream.sm_count(), 1024, 0, stream>>>
                                  (inout, lg_dsz, lg_blowup, bitrev, gen_powers);
 
