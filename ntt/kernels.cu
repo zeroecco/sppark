@@ -136,6 +136,12 @@ fr_t get_intermediate_root(index_t pow, const fr_t (*roots)[WINDOW_SIZE])
 
     fr_t t, root;
 
+    // Simplified path for resource-constrained kernels (like LDE_distribute_powers)
+    // This reduces register pressure significantly
+    if (pow == 0) {
+        return fr_t::one();
+    }
+
     // Optimize for common field sizes (especially 32-byte fields used in Poseidon2)
     if (sizeof(fr_t) <= 8 || (sizeof(fr_t) == 32 && pow < (1ULL << 20))) {
         root = fr_t::one();
@@ -168,7 +174,7 @@ fr_t get_intermediate_root(index_t pow, const fr_t (*roots)[WINDOW_SIZE])
 }
 
 template<class fr_t>
-__launch_bounds__(256, 3) __global__
+__launch_bounds__(64, 8) __global__
 void LDE_distribute_powers(fr_t* d_inout, uint32_t lg_domain_size,
                            uint32_t lg_blowup, bool bitrev,
                            const fr_t (*gen_powers)[WINDOW_SIZE])

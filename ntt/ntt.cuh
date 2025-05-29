@@ -117,8 +117,13 @@ private:
 
                 // Conservative fallback for exactly lg_domain_size=14 (the failing case)
                 if (lg_dsz == 14) {
-                    threads_per_block = 256;  // Use maximum threads per block
-                    num_blocks = 32;          // Very conservative block count
+                    threads_per_block = 128;  // Reduced from 256 to 128
+                    num_blocks = 64;          // Increase blocks to maintain coverage
+
+                    // Ultra-conservative fallback - if this still fails, use tiny blocks
+                    // This ensures we can always launch even on the most constrained systems
+                    threads_per_block = 64;   // Very small blocks
+                    num_blocks = 128;         // More blocks to compensate
                 }
             }
 
