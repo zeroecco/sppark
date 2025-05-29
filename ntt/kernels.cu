@@ -174,7 +174,7 @@ fr_t get_intermediate_root(index_t pow, const fr_t (*roots)[WINDOW_SIZE])
 }
 
 template<class fr_t>
-__launch_bounds__(64, 8) __global__
+__launch_bounds__(32, 16) __global__
 void LDE_distribute_powers(fr_t* d_inout, uint32_t lg_domain_size,
                            uint32_t lg_blowup, bool bitrev,
                            const fr_t (*gen_powers)[WINDOW_SIZE])
@@ -188,15 +188,37 @@ void LDE_distribute_powers(fr_t* d_inout, uint32_t lg_domain_size,
     // Optimize for Poseidon2: reduce branch divergence and improve memory access
     const index_t stride = blockDim.x * gridDim.x;
 
-    #pragma unroll 1
-    for (; idx < domain_size; idx += stride) {
+    // Simplified loop to reduce register pressure
+    while (idx < domain_size) {
         fr_t r = d_inout[idx];
 
         index_t pow = bitrev ? bit_rev(idx, lg_domain_size) : idx;
         pow <<= lg_blowup;
-        r *= get_intermediate_root(pow, gen_powers);
 
+        // Inline a simplified version of get_intermediate_root to reduce function call overhead
+        fr_t root = fr_t::one();
+        if (pow != 0) {
+            unsigned int off = 0;
+            if ((pow % WINDOW_SIZE) != 0) {
+                root = gen_powers[0][pow % WINDOW_SIZE];
+            } else {
+                pow >>= LG_WINDOW_SIZE;
+                off++;
+                root = gen_powers[off][pow % WINDOW_SIZE];
+            }
+
+            // Simplified multiplication loop
+            pow >>= LG_WINDOW_SIZE;
+            while (pow && off + 1 < WINDOW_NUM) {
+                root *= gen_powers[++off][pow % WINDOW_SIZE];
+                pow >>= LG_WINDOW_SIZE;
+            }
+        }
+
+        r *= root;
         d_inout[idx] = r;
+
+        idx += stride;
     }
 }
 

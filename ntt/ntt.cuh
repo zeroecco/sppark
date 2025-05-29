@@ -122,8 +122,8 @@ private:
 
                     // Ultra-conservative fallback - if this still fails, use tiny blocks
                     // This ensures we can always launch even on the most constrained systems
-                    threads_per_block = 64;   // Very small blocks
-                    num_blocks = 128;         // More blocks to compensate
+                    threads_per_block = 32;   // Minimal blocks matching launch_bounds
+                    num_blocks = 256;         // Many small blocks to compensate
                 }
             }
 
@@ -131,6 +131,12 @@ private:
                       << ", max_blocks=" << max_blocks
                       << ", final_num_blocks=" << num_blocks
                       << ", threads_per_block=" << threads_per_block << std::endl;
+
+            // Log total resource usage for debugging
+            std::cout << "[LDE_powers] Total threads: " << (num_blocks * threads_per_block)
+                      << ", estimated shared memory: " << (num_blocks * sizeof(fr_t))
+                      << " bytes" << std::endl;
+
             LDE_distribute_powers<<<num_blocks, threads_per_block, 0, stream>>>
                                  (inout, lg_dsz, lg_blowup, bitrev, gen_powers);
         } else {
