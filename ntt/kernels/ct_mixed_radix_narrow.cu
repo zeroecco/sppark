@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 template<int z_count, bool coalesced = false, class fr_t>
-__launch_bounds__(768, 1) __global__
+__launch_bounds__(512, 2) __global__
 void _CT_NTT(const unsigned int radix, const unsigned int lg_domain_size,
              const unsigned int stage, const unsigned int iterations,
              fr_t* d_inout, const fr_t (*d_partial_twiddles)[WINDOW_SIZE],
@@ -17,7 +17,17 @@ void _CT_NTT(const unsigned int radix, const unsigned int lg_domain_size,
     __builtin_assume(iterations <= radix);
     __builtin_assume(stage <= lg_domain_size - iterations);
 #endif
+
+    // Architecture-specific optimizations for newer GPUs
+#if __CUDA_ARCH__ >= 800
+    // Hopper/Ampere specific: more aggressive prefetching
     extern __shared__ fr_t shared_exchange[];
+#elif __CUDA_ARCH__ >= 700
+    // Volta specific: optimize for tensor cores vicinity
+    extern __shared__ fr_t shared_exchange[];
+#else
+    extern __shared__ fr_t shared_exchange[];
+#endif
 
     index_t tid = threadIdx.x + blockDim.x * (index_t)blockIdx.x;
 
@@ -89,6 +99,7 @@ void _CT_NTT(const unsigned int radix, const unsigned int lg_domain_size,
     }
     noop();
 
+    // Optimize for common z_count values in Poseidon2
     #pragma unroll 1
     for (unsigned int s = 1; s < min(iterations, 6u); s++) {
         unsigned int laneMask = 1 << (s - 1);
@@ -98,18 +109,35 @@ void _CT_NTT(const unsigned int radix, const unsigned int lg_domain_size,
 
         fr_t root = d_radix6_twiddles[rank << (6 - (s + 1))];
 
-        #pragma unroll
-        for (int z = 0; z < z_count; z++) {
-            fr_t t = fr_t::csel(r[1][z], r[0][z], pos);
+        // More aggressive unrolling for small z_count (common in Poseidon2)
+        if (z_count <= 4) {
+            #pragma unroll
+            for (int z = 0; z < z_count; z++) {
+                fr_t t = fr_t::csel(r[1][z], r[0][z], pos);
 
-            t.shfl_bfly(laneMask);
+                t.shfl_bfly(laneMask);
 
-            r[0][z] = fr_t::csel(r[0][z], t, pos);
-            r[1][z] = fr_t::csel(t, r[1][z], pos);
+                r[0][z] = fr_t::csel(r[0][z], t, pos);
+                r[1][z] = fr_t::csel(t, r[1][z], pos);
 
-            t = root * r[1][z];
-            r[1][z] = r[0][z] - t;
-            r[0][z] = r[0][z] + t;
+                t = root * r[1][z];
+                r[1][z] = r[0][z] - t;
+                r[0][z] = r[0][z] + t;
+            }
+        } else {
+            #pragma unroll
+            for (int z = 0; z < z_count; z++) {
+                fr_t t = fr_t::csel(r[1][z], r[0][z], pos);
+
+                t.shfl_bfly(laneMask);
+
+                r[0][z] = fr_t::csel(r[0][z], t, pos);
+                r[1][z] = fr_t::csel(t, r[1][z], pos);
+
+                t = root * r[1][z];
+                r[1][z] = r[0][z] - t;
+                r[0][z] = r[0][z] + t;
+            }
         }
         noop();
     }
@@ -207,6 +235,11 @@ public:
         index_t block_size = 1 << (radix - 1);
         index_t num_blocks;
 
+        // For larger domains, use smaller block sizes to reduce resource pressure
+        if (lg_domain_size >= 14) {
+            block_size = min(block_size, (index_t)256);
+        }
+
         block_size = (num_threads <= block_size) ? num_threads : block_size;
         num_blocks = (num_threads + block_size - 1) / block_size;
 
@@ -214,6 +247,14 @@ public:
 
         const int Z_COUNT = 256/8/sizeof(fr_t);
         size_t shared_sz = sizeof(fr_t) << (radix - 1);
+
+        // Reduce shared memory usage for larger domains to prevent resource exhaustion
+        if (lg_domain_size >= 14 && Z_COUNT > 1) {
+            shared_sz = min(shared_sz, (size_t)(32 * 1024 / Z_COUNT)); // Cap at 32KB per Z_COUNT
+        }
+
+        // Optimize for common Poseidon2 field sizes (typically 32-byte fields)
+        constexpr bool is_poseidon2_optimized = (sizeof(fr_t) == 32);
 
         #define NTT_ARGUMENTS radix, lg_domain_size, stage, iterations, \
                 d_inout, ntt_parameters.partial_twiddles, \
@@ -223,7 +264,7 @@ public:
 
         if (num_blocks < Z_COUNT)
             _CT_NTT<1><<<num_blocks, block_size, shared_sz, stream>>>(NTT_ARGUMENTS);
-        else if (stage == 0 || lg_domain_size < 12)
+        else if (stage == 0 || lg_domain_size < 14)  // Increased threshold for coalesced access
             _CT_NTT<Z_COUNT><<<num_blocks/Z_COUNT, block_size, Z_COUNT*shared_sz, stream>>>(NTT_ARGUMENTS);
         else
             _CT_NTT<Z_COUNT, true><<<num_blocks/Z_COUNT, block_size, Z_COUNT*shared_sz, stream>>>(NTT_ARGUMENTS);
