@@ -84,21 +84,48 @@ private:
         const auto gen_powers =
             NTTParameters::all(innt)[stream].partial_group_gen_powers;
 
-        if (domain_size < warpSize)
+        std::cout << "[LDE_powers] lg_dsz=" << lg_dsz
+                  << ", domain_size=" << domain_size
+                  << ", lg_blowup=" << lg_blowup
+                  << ", warpSize=" << warpSize
+                  << ", innt=" << innt
+                  << ", bitrev=" << bitrev << std::endl;
+
+        if (domain_size < warpSize) {
+            std::cout << "[LDE_powers] Branch 1: domain_size < warpSize, launching 1 block with "
+                      << domain_size << " threads" << std::endl;
             LDE_distribute_powers<<<1, domain_size, 0, stream>>>
                                  (inout, lg_dsz, lg_blowup, bitrev, gen_powers);
-        else if (lg_dsz < 32) {
+        } else if (lg_dsz < 32) {
             // Cap the number of blocks to prevent exceeding CUDA limits
             uint32_t desired_blocks = (uint32_t)(domain_size / warpSize);
             uint32_t max_blocks = stream.sm_count() * 2;
             uint32_t num_blocks = (desired_blocks < max_blocks) ? desired_blocks : max_blocks;
+            std::cout << "[LDE_powers] Branch 2: lg_dsz < 32, desired_blocks=" << desired_blocks
+                      << ", max_blocks=" << max_blocks
+                      << ", final_num_blocks=" << num_blocks
+                      << ", threads_per_block=" << warpSize << std::endl;
             LDE_distribute_powers<<<num_blocks, warpSize, 0, stream>>>
                                  (inout, lg_dsz, lg_blowup, bitrev, gen_powers);
-        } else
+        } else {
+            std::cout << "[LDE_powers] Branch 3: lg_dsz >= 32, launching "
+                      << stream.sm_count() << " blocks with 1024 threads each" << std::endl;
             LDE_distribute_powers<<<stream.sm_count(), 1024, 0, stream>>>
                                  (inout, lg_dsz, lg_blowup, bitrev, gen_powers);
+        }
 
         CUDA_OK(cudaGetLastError());
+
+        // Additional synchronization and error checking for debugging
+        cudaError_t sync_err = cudaStreamSynchronize(stream);
+        if (sync_err != cudaSuccess) {
+            std::cout << "[LDE_powers] ERROR: Stream synchronization failed: "
+                      << cudaGetErrorString(sync_err) << std::endl;
+        } else {
+            std::cout << "[LDE_powers] Stream synchronization completed successfully" << std::endl;
+        }
+
+        std::cout << "[LDE_powers] Function completed successfully" << std::endl;
     }
 
     static void CT_NTT(fr_t* d_inout, const int lg_domain_size, bool intt,
@@ -170,6 +197,11 @@ protected:
         // order of the data. In certain cases, bit reversal can be avoided which
         // results in a considerable performance gain.
 
+        std::cout << "[NTT_internal] Starting with lg_domain_size=" << lg_domain_size
+                  << ", order=" << static_cast<int>(order)
+                  << ", direction=" << (direction == Direction::forward ? "forward" : "inverse")
+                  << ", type=" << (type == Type::coset ? "coset" : "standard") << std::endl;
+
         const bool intt = direction == Direction::inverse;
         const auto& ntt_parameters = NTTParameters::all(intt)[stream];
         bool bitrev;
@@ -197,8 +229,10 @@ protected:
                 assert(false);
         }
 
-        if (!intt && type == Type::coset)
+        if (!intt && type == Type::coset) {
+            std::cout << "[NTT_internal] Calling LDE_powers for forward coset NTT" << std::endl;
             LDE_powers(d_inout, intt, bitrev, lg_domain_size, 0, stream);
+        }
 
         switch (algorithm) {
             case Algorithm::GS:
@@ -209,8 +243,10 @@ protected:
                 break;
         }
 
-        if (intt && type == Type::coset)
+        if (intt && type == Type::coset) {
+            std::cout << "[NTT_internal] Calling LDE_powers for inverse coset NTT" << std::endl;
             LDE_powers(d_inout, intt, !bitrev, lg_domain_size, 0, stream);
+        }
 
         if (order == InputOutputOrder::RR)
             bit_rev(d_inout, d_inout, lg_domain_size, stream);
@@ -356,6 +392,7 @@ public:
     static void LDE_powers(stream_t& stream, fr_t* d_inout,
                            uint32_t lg_domain_size)
     {
+        std::cout << "[LDE_powers_wrapper] Called with lg_domain_size=" << lg_domain_size << std::endl;
         LDE_powers(d_inout, false, true, lg_domain_size, 0, stream);
     }
 
