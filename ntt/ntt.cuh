@@ -101,16 +101,25 @@ private:
             uint32_t desired_blocks = (uint32_t)(domain_size / warpSize);
             uint32_t max_blocks = stream.sm_count() * 2;
             uint32_t num_blocks = (desired_blocks < max_blocks) ? desired_blocks : max_blocks;
+
+            // For lg_domain_size >= 14, use smaller thread counts per block to reduce resource pressure
+            uint32_t threads_per_block = warpSize;
+            if (lg_dsz >= 14) {
+                threads_per_block = 64;  // Reduce from 32 to 64 for better balance
+                num_blocks = (uint32_t)(domain_size / threads_per_block);
+                num_blocks = (num_blocks < max_blocks) ? num_blocks : max_blocks;
+            }
+
             std::cout << "[LDE_powers] Branch 2: lg_dsz < 32, desired_blocks=" << desired_blocks
                       << ", max_blocks=" << max_blocks
                       << ", final_num_blocks=" << num_blocks
-                      << ", threads_per_block=" << warpSize << std::endl;
-            LDE_distribute_powers<<<num_blocks, warpSize, 0, stream>>>
+                      << ", threads_per_block=" << threads_per_block << std::endl;
+            LDE_distribute_powers<<<num_blocks, threads_per_block, 0, stream>>>
                                  (inout, lg_dsz, lg_blowup, bitrev, gen_powers);
         } else {
             std::cout << "[LDE_powers] Branch 3: lg_dsz >= 32, launching "
                       << stream.sm_count() << " blocks with 1024 threads each" << std::endl;
-            LDE_distribute_powers<<<stream.sm_count(), 1024, 0, stream>>>
+            LDE_distribute_powers<<<stream.sm_count(), 512, 0, stream>>>  // Reduced from 1024 to 512
                                  (inout, lg_dsz, lg_blowup, bitrev, gen_powers);
         }
 

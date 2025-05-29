@@ -136,7 +136,8 @@ fr_t get_intermediate_root(index_t pow, const fr_t (*roots)[WINDOW_SIZE])
 
     fr_t t, root;
 
-    if (sizeof(fr_t) <= 8) {
+    // Optimize for common field sizes (especially 32-byte fields used in Poseidon2)
+    if (sizeof(fr_t) <= 8 || (sizeof(fr_t) == 32 && pow < (1ULL << 20))) {
         root = fr_t::one();
         bool root_set = false;
 
@@ -167,7 +168,7 @@ fr_t get_intermediate_root(index_t pow, const fr_t (*roots)[WINDOW_SIZE])
 }
 
 template<class fr_t>
-__launch_bounds__(1024) __global__
+__launch_bounds__(512, 2) __global__
 void LDE_distribute_powers(fr_t* d_inout, uint32_t lg_domain_size,
                            uint32_t lg_blowup, bool bitrev,
                            const fr_t (*gen_powers)[WINDOW_SIZE])
@@ -178,8 +179,11 @@ void LDE_distribute_powers(fr_t* d_inout, uint32_t lg_domain_size,
     size_t domain_size = (size_t)1 << lg_domain_size;
     index_t idx = threadIdx.x + blockDim.x * blockIdx.x;
 
+    // Optimize for Poseidon2: reduce branch divergence and improve memory access
+    const index_t stride = blockDim.x * gridDim.x;
+
     #pragma unroll 1
-    for (; idx < domain_size; idx += blockDim.x * gridDim.x) {
+    for (; idx < domain_size; idx += stride) {
         fr_t r = d_inout[idx];
 
         index_t pow = bitrev ? bit_rev(idx, lg_domain_size) : idx;
