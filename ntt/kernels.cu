@@ -168,7 +168,7 @@ fr_t get_intermediate_root(index_t pow, const fr_t (*roots)[WINDOW_SIZE])
 }
 
 template<class fr_t>
-__launch_bounds__(512, 2) __global__
+__launch_bounds__(256, 3) __global__
 void LDE_distribute_powers(fr_t* d_inout, uint32_t lg_domain_size,
                            uint32_t lg_blowup, bool bitrev,
                            const fr_t (*gen_powers)[WINDOW_SIZE])

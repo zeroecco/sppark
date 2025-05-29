@@ -102,12 +102,24 @@ private:
             uint32_t max_blocks = stream.sm_count() * 2;
             uint32_t num_blocks = (desired_blocks < max_blocks) ? desired_blocks : max_blocks;
 
-            // For lg_domain_size >= 14, use smaller thread counts per block to reduce resource pressure
+            // For lg_domain_size >= 14, use much smaller configurations to avoid resource exhaustion
             uint32_t threads_per_block = warpSize;
             if (lg_dsz >= 14) {
-                threads_per_block = 64;  // Reduce from 32 to 64 for better balance
+                threads_per_block = 128;  // Increase threads per block to reduce total blocks
                 num_blocks = (uint32_t)(domain_size / threads_per_block);
+                // Much more aggressive block count reduction for problematic cases
+                max_blocks = stream.sm_count();  // Reduce from sm_count * 2 to just sm_count
                 num_blocks = (num_blocks < max_blocks) ? num_blocks : max_blocks;
+                // Additional cap for very large domains
+                if (num_blocks > 64) {
+                    num_blocks = 64;  // Hard cap to prevent resource exhaustion
+                }
+
+                // Conservative fallback for exactly lg_domain_size=14 (the failing case)
+                if (lg_dsz == 14) {
+                    threads_per_block = 256;  // Use maximum threads per block
+                    num_blocks = 32;          // Very conservative block count
+                }
             }
 
             std::cout << "[LDE_powers] Branch 2: lg_dsz < 32, desired_blocks=" << desired_blocks
