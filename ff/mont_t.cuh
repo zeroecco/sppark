@@ -770,15 +770,6 @@ public:
         return even; // implicit cast to mont_t performs the reduction
     }
 
-    inline mont_t shfl_down(uint32_t off) const
-    {
-        mont_t ret;
-
-        for (size_t i = 0; i < n; i++)
-            ret[i] = __shfl_down_sync(0xffffffff, even[i], off);
-
-        return ret;
-    }
     inline mont_t shfl(uint32_t idx, uint32_t mask = 0xffffffff) const
     {
         mont_t ret;
@@ -833,7 +824,7 @@ private:
         }
         uint32_t off = __clz(a_hi | b_hi);
         /* |off| can be LIMB_T_BITS if all a[2..]|b[2..] were zeros */
-        off -= off==32 ? a_lo>>31 : 1;
+        off -= off==32 ? (a_lo | b_lo)>>31 : 1;
 
         a_ = approx_t{a[0], off<=32 ? lshift_2(a_hi, a_lo, off) : a_hi>>1 };
         b_ = approx_t{b[0], off<=32 ? lshift_2(b_hi, b_lo, off) : b_hi>>1 };

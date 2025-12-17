@@ -78,7 +78,7 @@ static inline cudaError_t cudaMallocManaged(T** uniPtr, size_t size)
 
 #define cudaHostAllocDefault                  hipHostMallocDefault
 #define cudaHostAllocPortable                 hipHostMallocPortable
-#define cudaHostAllocaMapped                  hipHostMallocMapped
+#define cudaHostAllocMapped                   hipHostMallocMapped
 #define cudaHostAllocWriteCombined            hipHostMallocWriteCombined
 template<typename T>
 static inline cudaError_t cudaHostAlloc(T** pinnedPtr, size_t size,
@@ -121,7 +121,9 @@ cudaLaunchCooperativeKernel(const T* func, dim3 gridDim, dim3 blockDim,
                                       stream);
 }
 
-static inline __device__ void __syncwarp() { asm volatile(""); }
+#if HIP_VERSION_MAJOR < 7
+static inline __device__ void __syncwarp() { __builtin_amdgcn_wave_barrier(); }
+#endif
 
 /*
  * To match CUDA, the 3-argument polyfills below are designed to produce
