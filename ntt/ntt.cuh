@@ -9,432 +9,437 @@
 #include <iostream>
 
 #include <util/exception.cuh>
-#include <util/rusterror.h>
+#include <util/gpu_config.cuh>
 #include <util/gpu_t.cuh>
+#include <util/rusterror.h>
 
 #if defined(__NVCC__)
-# define noop()
+#define noop()
 #elif defined(__HIPCC__)
-# pragma clang diagnostic push
-# pragma clang diagnostic ignored "-Wunused-function"
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-function"
 __device__ __noinline__ static void noop() { asm(""); }
-# pragma clang diagnostic push
+#pragma clang diagnostic push
 #endif
 
-#include "parameters.cuh"
 #include "kernels.cu"
+#include "parameters.cuh"
 
 #ifdef noop
-# undef noop
+#undef noop
 #endif
 
 class NTT {
 public:
-    enum class InputOutputOrder { NN, NR, RN, RR };
-    enum class Direction { forward, inverse };
-    enum class Type { standard, coset };
-    enum class Algorithm { GS, CT };
+  enum class InputOutputOrder { NN, NR, RN, RR };
+  enum class Direction { forward, inverse };
+  enum class Type { standard, coset };
+  enum class Algorithm { GS, CT };
 
 protected:
-    static void bit_rev(fr_t* d_out, const fr_t* d_inp,
-                        uint32_t lg_domain_size, stream_t& stream)
-    {
-        assert(lg_domain_size <= MAX_LG_DOMAIN_SIZE);
+  static void bit_rev(fr_t *d_out, const fr_t *d_inp, uint32_t lg_domain_size,
+                      stream_t &stream) {
+    assert(lg_domain_size <= MAX_LG_DOMAIN_SIZE);
 
-        size_t domain_size = (size_t)1 << lg_domain_size;
-        // aim to read 4 cache lines of consecutive data per read
-        const uint32_t Z_COUNT = 256 / sizeof(fr_t);
-        const uint32_t warpSize = gpu_props(stream).warpSize;
-        const uint32_t bsize = Z_COUNT>warpSize ? Z_COUNT : warpSize;
+    size_t domain_size = (size_t)1 << lg_domain_size;
+    // aim to read 4 cache lines of consecutive data per read
+    const uint32_t Z_COUNT = 256 / sizeof(fr_t);
+    const uint32_t warpSize = gpu_props(stream).warpSize;
+    const uint32_t bsize = Z_COUNT > warpSize ? Z_COUNT : warpSize;
 #ifdef __HIPCC__
-        const uint32_t lg_switch = 17;
+    const uint32_t lg_switch = 17;
 #else
-        const uint32_t lg_switch = 32;
+    const uint32_t lg_switch = 32;
 #endif
 
-        if (domain_size <= 1024)
-            bit_rev_permutation<<<1, domain_size, 0, stream>>>
-                               (d_out, d_inp, lg_domain_size);
-        else if (domain_size < bsize * Z_COUNT)
-            bit_rev_permutation<<<domain_size / bsize, bsize, 0, stream>>>
-                               (d_out, d_inp, lg_domain_size);
-        else if (Z_COUNT > warpSize || lg_domain_size <= lg_switch)
-            bit_rev_permutation_z<Z_COUNT><<<domain_size / Z_COUNT / bsize, bsize,
-                                             bsize * Z_COUNT * sizeof(fr_t),
-                                             stream>>>
-                                 (d_out, d_inp, lg_domain_size);
-        else
-            // Those GPUs that can reserve 96KB of shared memory can
-            // schedule 2 blocks to each SM...
-            bit_rev_permutation_z<Z_COUNT><<<stream.sm_count()*2, 192,
-                                             192 * Z_COUNT * sizeof(fr_t),
-                                             stream>>>
-                                 (d_out, d_inp, lg_domain_size);
+    if (domain_size <= 1024)
+      bit_rev_permutation<<<1, domain_size, 0, stream>>>(d_out, d_inp,
+                                                         lg_domain_size);
+    else if (domain_size < bsize * Z_COUNT)
+      bit_rev_permutation<<<domain_size / bsize, bsize, 0, stream>>>(
+          d_out, d_inp, lg_domain_size);
+    else if (Z_COUNT > warpSize || lg_domain_size <= lg_switch)
+      bit_rev_permutation_z<Z_COUNT>
+          <<<domain_size / Z_COUNT / bsize, bsize,
+             bsize * Z_COUNT * sizeof(fr_t), stream>>>(d_out, d_inp,
+                                                       lg_domain_size);
+    else
+      // Those GPUs that can reserve 96KB of shared memory can
+      // schedule 2 blocks to each SM...
+      bit_rev_permutation_z<Z_COUNT>
+          <<<stream.sm_count() * 2, 192, 192 * Z_COUNT * sizeof(fr_t),
+             stream>>>(d_out, d_inp, lg_domain_size);
 
-        CUDA_OK(cudaGetLastError());
-    }
+    CUDA_OK(cudaGetLastError());
+  }
 
 private:
-    static void LDE_powers(fr_t* inout, bool innt, bool bitrev,
-                           uint32_t lg_dsz, uint32_t lg_blowup,
-                           stream_t& stream)
-    {
-        size_t domain_size = (size_t)1 << lg_dsz;
-        const uint32_t warpSize = gpu_props(stream).warpSize;
-        const auto gen_powers =
-            NTTParameters::all(innt)[stream].partial_group_gen_powers;
+  static void LDE_powers(fr_t *inout, bool innt, bool bitrev, uint32_t lg_dsz,
+                         uint32_t lg_blowup, stream_t &stream) {
+    size_t domain_size = (size_t)1 << lg_dsz;
+    const gpu_config_t gpu_config = get_gpu_config(stream);
+    const uint32_t warpSize = gpu_config.warp_size;
+    const auto gen_powers =
+        NTTParameters::all(innt)[stream].partial_group_gen_powers;
 
-        std::cout << "[LDE_powers] lg_dsz=" << lg_dsz
-                  << ", domain_size=" << domain_size
-                  << ", lg_blowup=" << lg_blowup
-                  << ", warpSize=" << warpSize
-                  << ", innt=" << innt
-                  << ", bitrev=" << bitrev << std::endl;
+#ifdef DEBUG_NTT
+    std::cout << "[LDE_powers] lg_dsz=" << lg_dsz
+              << ", domain_size=" << domain_size << ", lg_blowup=" << lg_blowup
+              << ", warpSize=" << warpSize
+              << ", compute_cap=" << gpu_config.compute_capability_major << "."
+              << gpu_config.compute_capability_minor
+              << ", sm_count=" << gpu_config.sm_count << ", innt=" << innt
+              << ", bitrev=" << bitrev << std::endl;
+#endif
 
-        if (domain_size < warpSize) {
-            std::cout << "[LDE_powers] Branch 1: domain_size < warpSize, launching 1 block with "
-                      << domain_size << " threads" << std::endl;
-            LDE_distribute_powers<<<1, domain_size, 0, stream>>>
-                                 (inout, lg_dsz, lg_blowup, bitrev, gen_powers);
-        } else if (lg_dsz < 32) {
-            // Cap the number of blocks to prevent exceeding CUDA limits
-            uint32_t desired_blocks = (uint32_t)(domain_size / warpSize);
-            uint32_t max_blocks = stream.sm_count() * 2;
-            uint32_t num_blocks = (desired_blocks < max_blocks) ? desired_blocks : max_blocks;
+    if (domain_size < warpSize) {
+#ifdef DEBUG_NTT
+      std::cout << "[LDE_powers] Branch 1: domain_size < warpSize, launching 1 "
+                   "block with "
+                << domain_size << " threads" << std::endl;
+#endif
+      LDE_distribute_powers<<<1, domain_size, 0, stream>>>(
+          inout, lg_dsz, lg_blowup, bitrev, gen_powers);
+    } else if (lg_dsz < 32) {
+      // Use GPU-aware configuration
+      auto lde_config = gpu_config.get_lde_config(domain_size, lg_dsz);
 
-            // For lg_domain_size >= 14, use much smaller configurations to avoid resource exhaustion
-            uint32_t threads_per_block = warpSize;
-            if (lg_dsz >= 14) {
-                threads_per_block = 128;  // Increase threads per block to reduce total blocks
-                num_blocks = (uint32_t)(domain_size / threads_per_block);
-                // Much more aggressive block count reduction for problematic cases
-                max_blocks = stream.sm_count();  // Reduce from sm_count * 2 to just sm_count
-                num_blocks = (num_blocks < max_blocks) ? num_blocks : max_blocks;
-                // Additional cap for very large domains
-                if (num_blocks > 64) {
-                    num_blocks = 64;  // Hard cap to prevent resource exhaustion
-                }
+      uint32_t desired_blocks =
+          (uint32_t)(domain_size / lde_config.threads_per_block);
+      uint32_t num_blocks = std::min(desired_blocks, lde_config.max_blocks);
 
-                // Conservative fallback for exactly lg_domain_size=14 (the failing case)
-                if (lg_dsz == 14) {
-                    threads_per_block = 128;  // Reduced from 256 to 128
-                    num_blocks = 64;          // Increase blocks to maintain coverage
+#ifdef DEBUG_NTT
+      std::cout << "[LDE_powers] Branch 2: lg_dsz < 32, desired_blocks="
+                << desired_blocks << ", max_blocks=" << lde_config.max_blocks
+                << ", final_num_blocks=" << num_blocks
+                << ", threads_per_block=" << lde_config.threads_per_block
+                << " (GPU-aware config)" << std::endl;
 
-                    // Ultra-conservative fallback - if this still fails, use tiny blocks
-                    // This ensures we can always launch even on the most constrained systems
-                    threads_per_block = 32;   // Minimal blocks matching launch_bounds
-                    num_blocks = 256;         // Many small blocks to compensate
-                }
-            }
+      // Log total resource usage for debugging
+      std::cout << "[LDE_powers] Total threads: "
+                << (num_blocks * lde_config.threads_per_block)
+                << ", estimated shared memory: " << (num_blocks * sizeof(fr_t))
+                << " bytes" << std::endl;
+#endif
 
-            std::cout << "[LDE_powers] Branch 2: lg_dsz < 32, desired_blocks=" << desired_blocks
-                      << ", max_blocks=" << max_blocks
-                      << ", final_num_blocks=" << num_blocks
-                      << ", threads_per_block=" << threads_per_block << std::endl;
+      LDE_distribute_powers<<<num_blocks, lde_config.threads_per_block, 0,
+                              stream>>>(inout, lg_dsz, lg_blowup, bitrev,
+                                        gen_powers);
+    } else {
+      // For very large domains, use GPU-aware configuration
+      auto lde_config = gpu_config.get_lde_config(domain_size, lg_dsz);
+      uint32_t num_blocks = gpu_config.get_optimal_blocks(
+          (uint32_t)(domain_size / lde_config.threads_per_block),
+          lde_config.threads_per_block);
 
-            // Log total resource usage for debugging
-            std::cout << "[LDE_powers] Total threads: " << (num_blocks * threads_per_block)
-                      << ", estimated shared memory: " << (num_blocks * sizeof(fr_t))
-                      << " bytes" << std::endl;
-
-            LDE_distribute_powers<<<num_blocks, threads_per_block, 0, stream>>>
-                                 (inout, lg_dsz, lg_blowup, bitrev, gen_powers);
-        } else {
-            std::cout << "[LDE_powers] Branch 3: lg_dsz >= 32, launching "
-                      << stream.sm_count() << " blocks with 1024 threads each" << std::endl;
-            LDE_distribute_powers<<<stream.sm_count(), 512, 0, stream>>>  // Reduced from 1024 to 512
-                                 (inout, lg_dsz, lg_blowup, bitrev, gen_powers);
-        }
-
-        CUDA_OK(cudaGetLastError());
-
-        // Additional synchronization and error checking for debugging
-        cudaError_t sync_err = cudaStreamSynchronize(stream);
-        if (sync_err != cudaSuccess) {
-            std::cout << "[LDE_powers] ERROR: Stream synchronization failed: "
-                      << cudaGetErrorString(sync_err) << std::endl;
-        } else {
-            std::cout << "[LDE_powers] Stream synchronization completed successfully" << std::endl;
-        }
-
-        std::cout << "[LDE_powers] Function completed successfully" << std::endl;
+#ifdef DEBUG_NTT
+      std::cout << "[LDE_powers] Branch 3: lg_dsz >= 32, launching "
+                << num_blocks << " blocks with " << lde_config.threads_per_block
+                << " threads each (GPU-aware)" << std::endl;
+#endif
+      LDE_distribute_powers<<<num_blocks, lde_config.threads_per_block, 0,
+                              stream>>>(inout, lg_dsz, lg_blowup, bitrev,
+                                        gen_powers);
     }
 
-    static void CT_NTT(fr_t* d_inout, const int lg_domain_size, bool intt,
-                       const NTTParameters& ntt_parameters,
-                       const stream_t& stream)
-    {
-        CT_launcher params{d_inout, lg_domain_size, intt, ntt_parameters, stream};
+    CUDA_OK(cudaGetLastError());
 
-        if (lg_domain_size <= 10) {
-            params.step(lg_domain_size);
-        } else if (lg_domain_size <= 18) {
-            int step = lg_domain_size / 2;
-            params.step(step + lg_domain_size % 2);
-            params.step(step);
-        } else if (lg_domain_size <= 30) {
-            int step = lg_domain_size / 3;
-            int rem = lg_domain_size % 3;
-            params.step(step);
-            params.step(step + (lg_domain_size == 29 ? 1 : 0));
-            params.step(step + (lg_domain_size == 29 ? 1 : rem));
-        } else if (lg_domain_size <= 40) {
-            int step = lg_domain_size / 4;
-            int rem = lg_domain_size % 4;
-            params.step(step);
-            params.step(step + (rem > 2));
-            params.step(step + (rem > 1));
-            params.step(step + (rem > 0));
-        } else {
-            assert(false);
-        }
+#ifdef DEBUG_NTT
+    // Additional synchronization and error checking for debugging
+    cudaError_t sync_err = cudaStreamSynchronize(stream);
+    if (sync_err != cudaSuccess) {
+      std::cout << "[LDE_powers] ERROR: Stream synchronization failed: "
+                << cudaGetErrorString(sync_err) << std::endl;
+    } else {
+      std::cout << "[LDE_powers] Stream synchronization completed successfully"
+                << std::endl;
     }
 
-    static void GS_NTT(fr_t* d_inout, const int lg_domain_size, const bool is_intt,
-                       const NTTParameters& ntt_parameters,
-                       const stream_t& stream)
-    {
-        GS_launcher params{d_inout, lg_domain_size, is_intt, ntt_parameters, stream};
+    std::cout << "[LDE_powers] Function completed successfully" << std::endl;
+#endif
+  }
 
-        if (lg_domain_size <= 10) {
-            params.step(lg_domain_size);
-        } else if (lg_domain_size <= 18) {
-            int step = lg_domain_size / 2;
-            params.step(step);
-            params.step(step + lg_domain_size % 2);
-        } else if (lg_domain_size <= 30) {
-            int step = lg_domain_size / 3;
-            int rem = lg_domain_size % 3;
-            params.step(step + (lg_domain_size == 29 ? 1 : rem));
-            params.step(step + (lg_domain_size == 29 ? 1 : 0));
-            params.step(step);
-        } else if (lg_domain_size <= 40) {
-            int step = lg_domain_size / 4;
-            int rem = lg_domain_size % 4;
-            params.step(step + (rem > 0));
-            params.step(step + (rem > 1));
-            params.step(step + (rem > 2));
-            params.step(step);
-        } else {
-            assert(false);
-        }
+  static void CT_NTT(fr_t *d_inout, const int lg_domain_size, bool intt,
+                     const NTTParameters &ntt_parameters,
+                     const stream_t &stream) {
+    CT_launcher params{d_inout, lg_domain_size, intt, ntt_parameters, stream};
+
+    if (lg_domain_size <= 10) {
+      params.step(lg_domain_size);
+    } else if (lg_domain_size <= 18) {
+      int step = lg_domain_size / 2;
+      params.step(step + lg_domain_size % 2);
+      params.step(step);
+    } else if (lg_domain_size <= 30) {
+      int step = lg_domain_size / 3;
+      int rem = lg_domain_size % 3;
+      params.step(step);
+      params.step(step + (lg_domain_size == 29 ? 1 : 0));
+      params.step(step + (lg_domain_size == 29 ? 1 : rem));
+    } else if (lg_domain_size <= 40) {
+      int step = lg_domain_size / 4;
+      int rem = lg_domain_size % 4;
+      params.step(step);
+      params.step(step + (rem > 2));
+      params.step(step + (rem > 1));
+      params.step(step + (rem > 0));
+    } else {
+      assert(false);
     }
+  }
+
+  static void GS_NTT(fr_t *d_inout, const int lg_domain_size,
+                     const bool is_intt, const NTTParameters &ntt_parameters,
+                     const stream_t &stream) {
+    GS_launcher params{d_inout, lg_domain_size, is_intt, ntt_parameters,
+                       stream};
+
+    if (lg_domain_size <= 10) {
+      params.step(lg_domain_size);
+    } else if (lg_domain_size <= 18) {
+      int step = lg_domain_size / 2;
+      params.step(step);
+      params.step(step + lg_domain_size % 2);
+    } else if (lg_domain_size <= 30) {
+      int step = lg_domain_size / 3;
+      int rem = lg_domain_size % 3;
+      params.step(step + (lg_domain_size == 29 ? 1 : rem));
+      params.step(step + (lg_domain_size == 29 ? 1 : 0));
+      params.step(step);
+    } else if (lg_domain_size <= 40) {
+      int step = lg_domain_size / 4;
+      int rem = lg_domain_size % 4;
+      params.step(step + (rem > 0));
+      params.step(step + (rem > 1));
+      params.step(step + (rem > 2));
+      params.step(step);
+    } else {
+      assert(false);
+    }
+  }
 
 protected:
-    static void NTT_internal(fr_t* d_inout, uint32_t lg_domain_size,
-                             InputOutputOrder order, Direction direction,
-                             Type type, stream_t& stream)
-    {
-        // Pick an NTT algorithm based on the input order and the desired output
-        // order of the data. In certain cases, bit reversal can be avoided which
-        // results in a considerable performance gain.
+  static void NTT_internal(fr_t *d_inout, uint32_t lg_domain_size,
+                           InputOutputOrder order, Direction direction,
+                           Type type, stream_t &stream) {
+    // Pick an NTT algorithm based on the input order and the desired output
+    // order of the data. In certain cases, bit reversal can be avoided which
+    // results in a considerable performance gain.
 
-        std::cout << "[NTT_internal] Starting with lg_domain_size=" << lg_domain_size
-                  << ", order=" << static_cast<int>(order)
-                  << ", direction=" << (direction == Direction::forward ? "forward" : "inverse")
-                  << ", type=" << (type == Type::coset ? "coset" : "standard") << std::endl;
+#ifdef DEBUG_NTT
+    std::cout << "[NTT_internal] Starting with lg_domain_size="
+              << lg_domain_size << ", order=" << static_cast<int>(order)
+              << ", direction="
+              << (direction == Direction::forward ? "forward" : "inverse")
+              << ", type=" << (type == Type::coset ? "coset" : "standard")
+              << std::endl;
+#endif
 
-        const bool intt = direction == Direction::inverse;
-        const auto& ntt_parameters = NTTParameters::all(intt)[stream];
-        bool bitrev;
-        Algorithm algorithm;
+    const bool intt = direction == Direction::inverse;
+    const auto &ntt_parameters = NTTParameters::all(intt)[stream];
+    bool bitrev;
+    Algorithm algorithm;
 
-        switch (order) {
-            case InputOutputOrder::NN:
-                bit_rev(d_inout, d_inout, lg_domain_size, stream);
-                bitrev = true;
-                algorithm = Algorithm::CT;
-                break;
-            case InputOutputOrder::NR:
-                bitrev = false;
-                algorithm = Algorithm::GS;
-                break;
-            case InputOutputOrder::RN:
-                bitrev = true;
-                algorithm = Algorithm::CT;
-                break;
-            case InputOutputOrder::RR:
-                bitrev = true;
-                algorithm = Algorithm::GS;
-                break;
-            default:
-                assert(false);
-        }
-
-        if (!intt && type == Type::coset) {
-            std::cout << "[NTT_internal] Calling LDE_powers for forward coset NTT" << std::endl;
-            LDE_powers(d_inout, intt, bitrev, lg_domain_size, 0, stream);
-        }
-
-        switch (algorithm) {
-            case Algorithm::GS:
-                GS_NTT(d_inout, lg_domain_size, intt, ntt_parameters, stream);
-                break;
-            case Algorithm::CT:
-                CT_NTT(d_inout, lg_domain_size, intt, ntt_parameters, stream);
-                break;
-        }
-
-        if (intt && type == Type::coset) {
-            std::cout << "[NTT_internal] Calling LDE_powers for inverse coset NTT" << std::endl;
-            LDE_powers(d_inout, intt, !bitrev, lg_domain_size, 0, stream);
-        }
-
-        if (order == InputOutputOrder::RR)
-            bit_rev(d_inout, d_inout, lg_domain_size, stream);
+    switch (order) {
+    case InputOutputOrder::NN:
+      bit_rev(d_inout, d_inout, lg_domain_size, stream);
+      bitrev = true;
+      algorithm = Algorithm::CT;
+      break;
+    case InputOutputOrder::NR:
+      bitrev = false;
+      algorithm = Algorithm::GS;
+      break;
+    case InputOutputOrder::RN:
+      bitrev = true;
+      algorithm = Algorithm::CT;
+      break;
+    case InputOutputOrder::RR:
+      bitrev = true;
+      algorithm = Algorithm::GS;
+      break;
+    default:
+      assert(false);
     }
+
+    if (!intt && type == Type::coset) {
+#ifdef DEBUG_NTT
+      std::cout << "[NTT_internal] Calling LDE_powers for forward coset NTT"
+                << std::endl;
+#endif
+      LDE_powers(d_inout, intt, bitrev, lg_domain_size, 0, stream);
+    }
+
+    switch (algorithm) {
+    case Algorithm::GS:
+      GS_NTT(d_inout, lg_domain_size, intt, ntt_parameters, stream);
+      break;
+    case Algorithm::CT:
+      CT_NTT(d_inout, lg_domain_size, intt, ntt_parameters, stream);
+      break;
+    }
+
+    if (intt && type == Type::coset) {
+#ifdef DEBUG_NTT
+      std::cout << "[NTT_internal] Calling LDE_powers for inverse coset NTT"
+                << std::endl;
+#endif
+      LDE_powers(d_inout, intt, !bitrev, lg_domain_size, 0, stream);
+    }
+
+    if (order == InputOutputOrder::RR)
+      bit_rev(d_inout, d_inout, lg_domain_size, stream);
+  }
 
 public:
-    static RustError Base(const gpu_t& gpu, fr_t* inout, uint32_t lg_domain_size,
-                          InputOutputOrder order, Direction direction,
-                          Type type)
-    {
-        if (lg_domain_size == 0)
-            return RustError{cudaSuccess};
+  static RustError Base(const gpu_t &gpu, fr_t *inout, uint32_t lg_domain_size,
+                        InputOutputOrder order, Direction direction,
+                        Type type) {
+    if (lg_domain_size == 0)
+      return RustError{cudaSuccess};
 
-        try {
-            gpu.select();
+    try {
+      gpu.select();
 
-            size_t domain_size = (size_t)1 << lg_domain_size;
-            dev_ptr_t<fr_t> d_inout{domain_size, gpu};
-            gpu.HtoD(&d_inout[0], inout, domain_size);
+      size_t domain_size = (size_t)1 << lg_domain_size;
+      dev_ptr_t<fr_t> d_inout{domain_size, gpu};
+      gpu.HtoD(&d_inout[0], inout, domain_size);
 
-            NTT_internal(&d_inout[0], lg_domain_size, order, direction, type, gpu);
+      NTT_internal(&d_inout[0], lg_domain_size, order, direction, type, gpu);
 
-            gpu.DtoH(inout, &d_inout[0], domain_size);
-            gpu.sync();
-        } catch (const cuda_error& e) {
-            gpu.sync();
+      gpu.DtoH(inout, &d_inout[0], domain_size);
+      gpu.sync();
+    } catch (const cuda_error &e) {
+      gpu.sync();
 #ifdef TAKE_RESPONSIBILITY_FOR_ERROR_MESSAGE
-            return RustError{e.code(), e.what()};
+      return RustError{e.code(), e.what()};
 #else
-            return RustError{e.code()};
+      return RustError{e.code()};
 #endif
-        }
-
-        return RustError{cudaSuccess};
     }
 
+    return RustError{cudaSuccess};
+  }
+
 protected:
-    static void LDE_launch(stream_t& stream,
-                           fr_t* ext_domain_data, fr_t* domain_data,
-                           const fr_t (*gen_powers)[WINDOW_SIZE],
+  static void LDE_launch(stream_t &stream, fr_t *ext_domain_data,
+                         fr_t *domain_data,
+                         const fr_t (*gen_powers)[WINDOW_SIZE],
+                         uint32_t lg_domain_size, uint32_t lg_blowup,
+                         bool perform_shift = true, bool ext_pow = false) {
+    assert(lg_domain_size + lg_blowup <= MAX_LG_DOMAIN_SIZE);
+    size_t domain_size = (size_t)1 << lg_domain_size;
+
+    // Determine the max power of 2 SM count
+    size_t kernel_sms = stream.sm_count();
+    while (kernel_sms & (kernel_sms - 1))
+      kernel_sms -= (kernel_sms & (0 - kernel_sms));
+
+    size_t device_max_threads = kernel_sms * 1024;
+    uint32_t num_blocks, block_size;
+
+    if (device_max_threads < domain_size) {
+      num_blocks = kernel_sms;
+      block_size = 1024;
+    } else if (domain_size < 1024) {
+      num_blocks = 1;
+      block_size = domain_size;
+    } else {
+      num_blocks = domain_size / 1024;
+      block_size = 1024;
+    }
+
+    stream.launch_coop(
+        LDE_spread_distribute_powers,
+        launch_params_t{num_blocks, block_size, sizeof(fr_t) * block_size},
+        ext_domain_data, domain_data, gen_powers, lg_domain_size, lg_blowup,
+        perform_shift, ext_pow);
+  }
+
+public:
+  static RustError LDE_aux(const gpu_t &gpu, fr_t *inout,
                            uint32_t lg_domain_size, uint32_t lg_blowup,
-                           bool perform_shift = true, bool ext_pow = false)
-    {
-        assert(lg_domain_size + lg_blowup <= MAX_LG_DOMAIN_SIZE);
-        size_t domain_size = (size_t)1 << lg_domain_size;
+                           fr_t *aux_out = nullptr) {
+    try {
+      size_t domain_size = (size_t)1 << lg_domain_size;
+      size_t ext_domain_size = domain_size << lg_blowup;
+      size_t aux_size = aux_out != nullptr ? domain_size : 0;
+      // The 2nd to last 'domain_size' chunk will hold the original data
+      // The last chunk will get the bit reversed iNTT data
+      dev_ptr_t<fr_t> d_inout{ext_domain_size + aux_size,
+                              gpu}; // + domain_size for aux buffer
+      fr_t *aux_data = &d_inout[ext_domain_size];
+      fr_t *domain_data =
+          &d_inout[ext_domain_size - domain_size]; // aligned to the end
+      fr_t *ext_domain_data = &d_inout[0];
 
-        // Determine the max power of 2 SM count
-        size_t kernel_sms = stream.sm_count();
-        while (kernel_sms & (kernel_sms - 1))
-            kernel_sms -= (kernel_sms & (0 - kernel_sms));
+      gpu.HtoD(domain_data, inout, domain_size);
 
-        size_t device_max_threads = kernel_sms * 1024;
-        uint32_t num_blocks, block_size;
+      NTT_internal(domain_data, lg_domain_size, InputOutputOrder::NR,
+                   Direction::inverse, Type::standard, gpu);
 
-        if (device_max_threads < domain_size) {
-            num_blocks = kernel_sms;
-            block_size = 1024;
-        } else if (domain_size < 1024) {
-            num_blocks = 1;
-            block_size = domain_size;
-        } else {
-            num_blocks = domain_size / 1024;
-            block_size = 1024;
-        }
+      const auto gen_powers =
+          NTTParameters::all()[gpu.id()].partial_group_gen_powers;
 
-        stream.launch_coop(LDE_spread_distribute_powers,
-                        launch_params_t{num_blocks, block_size,
-                                        sizeof(fr_t) * block_size},
-                        ext_domain_data, domain_data, gen_powers,
-                        lg_domain_size, lg_blowup, perform_shift, ext_pow);
-    }
+      event_t sync_event;
 
-public:
-    static RustError LDE_aux(const gpu_t& gpu, fr_t* inout,
-                             uint32_t lg_domain_size, uint32_t lg_blowup,
-                             fr_t *aux_out = nullptr)
-    {
-        try {
-            size_t domain_size = (size_t)1 << lg_domain_size;
-            size_t ext_domain_size = domain_size << lg_blowup;
-            size_t aux_size = aux_out != nullptr ? domain_size : 0;
-            // The 2nd to last 'domain_size' chunk will hold the original data
-            // The last chunk will get the bit reversed iNTT data
-            dev_ptr_t<fr_t> d_inout{ext_domain_size + aux_size, gpu}; // + domain_size for aux buffer
-            fr_t* aux_data = &d_inout[ext_domain_size];
-            fr_t* domain_data = &d_inout[ext_domain_size - domain_size]; // aligned to the end
-            fr_t* ext_domain_data = &d_inout[0];
+      if (aux_out != nullptr) {
+        bit_rev(aux_data, domain_data, lg_domain_size, gpu);
+        sync_event.record(gpu);
+      }
 
-            gpu.HtoD(domain_data, inout, domain_size);
+      LDE_launch(gpu, ext_domain_data, domain_data, gen_powers, lg_domain_size,
+                 lg_blowup);
 
-            NTT_internal(domain_data, lg_domain_size,
-                         InputOutputOrder::NR, Direction::inverse,
-                         Type::standard, gpu);
+      // NTT - RN
+      NTT_internal(ext_domain_data, lg_domain_size + lg_blowup,
+                   InputOutputOrder::RN, Direction::forward, Type::standard,
+                   gpu);
 
-            const auto gen_powers =
-                NTTParameters::all()[gpu.id()].partial_group_gen_powers;
-
-            event_t sync_event;
-
-            if (aux_out != nullptr) {
-                bit_rev(aux_data, domain_data, lg_domain_size, gpu);
-                sync_event.record(gpu);
-            }
-
-            LDE_launch(gpu, ext_domain_data, domain_data, gen_powers,
-                       lg_domain_size, lg_blowup);
-
-            // NTT - RN
-            NTT_internal(ext_domain_data, lg_domain_size + lg_blowup,
-                         InputOutputOrder::RN, Direction::forward,
-                         Type::standard, gpu);
-
-            if (aux_out != nullptr) {
-                sync_event.wait(gpu[0]);
-                gpu[0].DtoH(aux_out, aux_data, aux_size);
-            }
-            gpu.DtoH(inout, ext_domain_data, ext_domain_size);
-            gpu.sync();
-        } catch (const cuda_error& e) {
-            gpu.sync();
+      if (aux_out != nullptr) {
+        sync_event.wait(gpu[0]);
+        gpu[0].DtoH(aux_out, aux_data, aux_size);
+      }
+      gpu.DtoH(inout, ext_domain_data, ext_domain_size);
+      gpu.sync();
+    } catch (const cuda_error &e) {
+      gpu.sync();
 #ifdef TAKE_RESPONSIBILITY_FOR_ERROR_MESSAGE
-            return RustError{e.code(), e.what()};
+      return RustError{e.code(), e.what()};
 #else
-            return RustError{e.code()};
+      return RustError{e.code()};
 #endif
-        }
-
-        return RustError{cudaSuccess};
     }
 
-    static RustError LDE(const gpu_t& gpu, fr_t* inout,
-                         uint32_t lg_domain_size, uint32_t lg_blowup)
-    {   return LDE_aux(gpu, inout, lg_domain_size, lg_blowup);   }
+    return RustError{cudaSuccess};
+  }
 
-    static void Base_dev_ptr(stream_t& stream, fr_t* d_inout,
-                             uint32_t lg_domain_size, InputOutputOrder order,
-                             Direction direction, Type type)
-    {
-        NTT_internal(&d_inout[0], lg_domain_size, order, direction, type,
-                     stream);
-    }
+  static RustError LDE(const gpu_t &gpu, fr_t *inout, uint32_t lg_domain_size,
+                       uint32_t lg_blowup) {
+    return LDE_aux(gpu, inout, lg_domain_size, lg_blowup);
+  }
 
-    static void LDE_powers(stream_t& stream, fr_t* d_inout,
-                           uint32_t lg_domain_size)
-    {
-        std::cout << "[LDE_powers_wrapper] Called with lg_domain_size=" << lg_domain_size << std::endl;
-        LDE_powers(d_inout, false, true, lg_domain_size, 0, stream);
-    }
+  static void Base_dev_ptr(stream_t &stream, fr_t *d_inout,
+                           uint32_t lg_domain_size, InputOutputOrder order,
+                           Direction direction, Type type) {
+    NTT_internal(&d_inout[0], lg_domain_size, order, direction, type, stream);
+  }
 
-    // If d_out and d_in overlap, d_out is expected to encompass d_in and
-    // d_in is expected to be aligned to the end of d_out
-    // The input is expected to be in bit-reversed order
-    static void LDE_expand(stream_t& stream, fr_t* d_out, fr_t* d_in,
-                           uint32_t lg_domain_size, uint32_t lg_blowup)
-    {
-        LDE_launch(stream, d_out, d_in, NULL, lg_domain_size, lg_blowup, false);
-    }
+  static void LDE_powers(stream_t &stream, fr_t *d_inout,
+                         uint32_t lg_domain_size) {
+#ifdef DEBUG_NTT
+    std::cout << "[LDE_powers_wrapper] Called with lg_domain_size="
+              << lg_domain_size << std::endl;
+#endif
+    LDE_powers(d_inout, false, true, lg_domain_size, 0, stream);
+  }
+
+  // If d_out and d_in overlap, d_out is expected to encompass d_in and
+  // d_in is expected to be aligned to the end of d_out
+  // The input is expected to be in bit-reversed order
+  static void LDE_expand(stream_t &stream, fr_t *d_out, fr_t *d_in,
+                         uint32_t lg_domain_size, uint32_t lg_blowup) {
+    LDE_launch(stream, d_out, d_in, NULL, lg_domain_size, lg_blowup, false);
+  }
 };
 #endif

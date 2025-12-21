@@ -174,7 +174,27 @@ fr_t get_intermediate_root(index_t pow, const fr_t (*roots)[WINDOW_SIZE])
 }
 
 template<class fr_t>
-__launch_bounds__(32, 16) __global__
+#if defined(__CUDA_ARCH__)
+  #if __CUDA_ARCH__ >= 1000
+    // Blackwell (B100/B200): massive parallelism, enhanced register file
+    __launch_bounds__(256, 8)
+  #elif __CUDA_ARCH__ >= 900
+    // Hopper (H100): high thread count with good occupancy
+    __launch_bounds__(128, 8)
+  #elif __CUDA_ARCH__ >= 800
+    // Ampere (A100): more threads, better utilization
+    __launch_bounds__(128, 8)
+  #elif __CUDA_ARCH__ >= 700
+    // Volta/Turing: moderate thread count
+    __launch_bounds__(64, 8)
+  #else
+    // Older architectures: conservative
+    __launch_bounds__(32, 8)
+  #endif
+#else
+  __launch_bounds__(32, 16)
+#endif
+__global__
 void LDE_distribute_powers(fr_t* d_inout, uint32_t lg_domain_size,
                            uint32_t lg_blowup, bool bitrev,
                            const fr_t (*gen_powers)[WINDOW_SIZE])
