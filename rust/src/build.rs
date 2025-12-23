@@ -35,6 +35,16 @@ pub fn ccmd() -> cc::Build {
                 out.status.success()
             }
 
+            fn add_gencode_if_supported(nvcc: &mut cc::Build, arch: &str) {
+                let flag = format!("-arch={}", arch);
+                if is_cuda_flag_supported(nvcc, &flag) {
+                    let compute = arch.trim_start_matches("sm_");
+                    nvcc.flag("-gencode")
+                        .flag(format!("arch=compute_{},code={}", compute, arch))
+                        .flag("-t0");
+                }
+            }
+
             let mut nvcc = cc::Build::new();
 
             nvcc.cuda(true);
@@ -42,14 +52,13 @@ pub fn ccmd() -> cc::Build {
                 nvcc.flag("-arch=native");
             } else {
                 nvcc.flag("-arch=sm_80");
+                add_gencode_if_supported(&mut nvcc, "sm_86");
+                add_gencode_if_supported(&mut nvcc, "sm_89");
+                add_gencode_if_supported(&mut nvcc, "sm_90");
                 if is_cuda_flag_supported(&nvcc, "-arch=sm_70") {
-                    nvcc.flag("-gencode")
-                        .flag("arch=compute_70,code=sm_70")
-                        .flag("-t0");
+                    add_gencode_if_supported(&mut nvcc, "sm_70");
                 } else if is_cuda_flag_supported(&nvcc, "-arch=sm_75") {
-                    nvcc.flag("-gencode")
-                        .flag("arch=compute_75,code=sm_75")
-                        .flag("-t0");
+                    add_gencode_if_supported(&mut nvcc, "sm_75");
                 }
             }
             #[cfg(not(target_env = "msvc"))]

@@ -219,6 +219,14 @@ func is_cuda_flag_supported(nvcc string, flag string) bool {
     return err == nil
 }
 
+func append_cuda_gencode_if_supported(args []string, nvcc string, arch string) []string {
+    if !is_cuda_flag_supported(nvcc, "-arch="+arch) {
+        return args
+    }
+    compute := strings.TrimPrefix(arch, "sm_")
+    return append(args, "-gencode", "arch=compute_"+compute+",code="+arch, "-t0")
+}
+
 func is_rocm_flag_supported(hipcc string, flag string) bool {
     cmd := exec.Command(hipcc, flag, "-fsyntax-only", "-x", "hip", os.DevNull,
                                "-Wno-unused-command-line-argument")
@@ -310,10 +318,13 @@ func build(dst string, src string, custom_args ...string) bool {
         // by default...
         if !is_arch_native(custom_args...) {
             args = append(args, "-arch=sm_80")
+            args = append_cuda_gencode_if_supported(args, nvcc, "sm_86")
+            args = append_cuda_gencode_if_supported(args, nvcc, "sm_89")
+            args = append_cuda_gencode_if_supported(args, nvcc, "sm_90")
             if is_cuda_flag_supported(nvcc, "-arch=sm_70") {
-                args = append(args, "-gencode", "arch=compute_70,code=sm_70", "-t0")
+                args = append_cuda_gencode_if_supported(args, nvcc, "sm_70")
             } else if is_cuda_flag_supported(nvcc, "-arch=sm_75") {
-                args = append(args, "-gencode", "arch=compute_75,code=sm_75", "-t0")
+                args = append_cuda_gencode_if_supported(args, nvcc, "sm_75")
             }
         }
         args = append(args, "-cudart=shared")
